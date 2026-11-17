@@ -18,10 +18,11 @@ executing every NetBox operation as the corresponding human user. The server
 creates and maintains a personal NetBox API token; users do not copy it into
 their MCP clients. NetBox permissions and change attribution remain authoritative.
 
-The initial integration targets clients that accept a preconfigured OAuth client
-ID and secret. Test each supported client, including hosted clients, against the
-chosen provider before implementation. Availability of configuration controls,
-callback URLs, discovery behavior and refresh behavior are integration questions.
+The required clients are **claude.ai, Claude Code, chatgpt.com and Codex CLI**,
+using Streamable HTTP at the same HTTPS MCP endpoint. Each uses a pre-registered
+OAuth client for the initial integration. Current client capabilities support
+this approach; successful operation with the selected provider is still an
+integration gate, not an implemented or tested compatibility claim.
 
 Existing NetBox-token passthrough remains available on the same MCP endpoint.
 Passthrough is authorized by NetBox, independently of the OIDC application.
@@ -81,12 +82,33 @@ provider can serve multiple clients, with the operational consequence that a
 client-secret rotation affects all of them. Separate providers require an
 explicit multi-issuer design and separate identity mappings.
 
+This shared registration is an initial deployment constraint, not client
+isolation. CLI users can access a locally stored client secret; possession of
+that secret must never authorize a user or replace PKCE, group and token checks.
+Enable authorization-code and refresh grants for this registration, and disable
+client-credentials, implicit and other unused grants. Splitting registrations
+requires an explicit issuer/client allowlist design before deployment; do not
+silently broaden the verifier to accept arbitrary clients.
+
+Require authorization-code flow with **PKCE S256**, including for confidential
+clients. Discovery must advertise `code_challenge_methods_supported: ["S256"]`
+and the supported `token_endpoint_auth_methods_supported`. Record and test the
+actual method selected by each client (for example `client_secret_basic` or
+`client_secret_post`), both at code exchange and refresh. Reject authorization
+without an S256 challenge, an absent or incorrect PKCE verifier, and a code
+exchange with a mismatched redirect URI.
+Only advertise `authorization_response_iss_parameter_supported: true` when
+every authorization response includes the correct issuer; test client rejection
+of missing/mismatched response `iss` when this support is advertised.
+
 Assign an application binding for the required group. Configure the
 `netbox-mcp` scope mapping to return the `groups` claim itself, so requesting
 that scope requests the authorization data. Enable inclusion of mapped claims
-in access tokens for the reference provider. Also provide `openid`, `profile`,
-`email` and `offline_access` where required by the clients. Verify actual access
-and ID tokens; synthetic claims alone are not an interoperability test.
+in access tokens for the reference provider. The initial requested scope set is
+`openid profile email offline_access netbox-mcp`. Advertise these scopes in
+discovery and resource metadata, enable refresh-token issuance and verify the
+actual scope set requested by every client. Verify actual access and ID tokens;
+synthetic claims alone are not an interoperability test.
 
 Use a stable subject mode based on an immutable provider user identifier.
 Identity is `(iss, sub)`. At first login, resolve `preferred_username` to exactly
@@ -94,10 +116,26 @@ one active NetBox user, then persist the NetBox user ID. Subsequent logins follo
 that ID, including after a username change. Missing or ambiguous mappings deny
 access; a deleted user must not be reassigned through a reused username.
 
-For this initial provider contract, `aud` and `azp` both equal the dedicated
-client ID. If the provider does not implement resource-bound audiences, the
-dedicated client and scope provide the selected isolation boundary. Record the
-provider's actual handling of the OAuth `resource` parameter in the pilot.
+The canonical resource identifier is the exact `MCP_PUBLIC_URL`, initially
+`https://inventory.example.com/mcp`. Require `OIDC_AUDIENCE` to equal that value;
+the access token's `aud` must be that string or a string array containing it.
+Validate `azp` separately against `OIDC_CLIENT_ID`, the dedicated registration.
+The OAuth client ID is not a substitute for the MCP resource audience.
+
+Verify that authorization and token requests carry the intended `resource` and
+that the provider binds the issued access token to it. A different resource must
+be rejected or receive a token unusable at this MCP endpoint. Refresh must
+preserve the audience and authorized party without broadening scopes. Reject
+tokens containing only the client-ID audience, even if their signature, group
+and scope are otherwise valid. ID tokens remain intended for the OAuth client
+and must not be accepted as MCP access tokens.
+
+**Provider gate:** do not assume the reference Authentik version can implement
+this resource contract. Prove it with real authorization, exchange and refresh
+requests before implementing the broker. If it cannot, stop Phase A and revise
+the provider integration or architecture. An OAuth proxy remains outside the
+initial scope; introducing one requires a revised design. A successful login
+with a client-ID-only audience does not pass this gate.
 
 Measure removal from the application binding, removal from the required group,
 and account deactivation separately. Acceptance requires denial of newly issued
@@ -113,6 +151,48 @@ access. Prove a new authorization fails for the denied test user and succeeds
 for a control user before interpreting refresh results. Restore the original
 mode and bindings afterward.
 
+### Client setup and acceptance
+
+The following setup requirements were checked against the official client
+documentation on 2026-11-17. Recheck them for the versions and workspace policies
+used in the pilot. Use each product's direct remote MCP setup; do not count an
+imported claude.ai connector in Claude Code as a test of its own OAuth client.
+
+| Client | Registration and connection | Callback requirements |
+| --- | --- | --- |
+| claude.ai | Custom remote connector; choose the existing/own OAuth client and supply its ID and secret. Allow connections from the hosted service to HTTPS port 443. | Register `https://claude.ai/api/mcp/auth_callback`. |
+| Claude Code | Direct HTTP MCP server with `--client-id`, masked `--client-secret` input and `--callback-port`; authenticate with `claude mcp login` or `/mcp`. | Register the exact loopback URI sent by the tested version, normally `http://localhost:PORT/callback`; match the configured listener port. Version 2.1.229 used `127.0.0.1`; 2.1.231 restored `localhost`. |
+| chatgpt.com | Custom MCP app/plugin with a predefined OAuth client in an account/workspace that permits the required read and write tools. | Copy the exact redirect from its management page. Depending on issuer support and connection history, it can be `https://chatgpt.com/connector/oauth/{callback_id}` or `https://chatgpt.com/connector_platform_oauth_redirect`. |
+| Codex CLI | Direct Streamable HTTP server with `--oauth-client-id` and the pre-registered secret configured privately; authenticate with `codex mcp login`. CLI 0.169.0 exposes the required flags; this is not a tested minimum version. | Register the callback displayed by `codex mcp add`. Preserve any server-specific callback suffix; configure the listener port separately from the callback URL. |
+
+For Claude Code, choose an available fixed callback port before registering the
+URI. For Codex CLI, use `mcp_servers.<name>.oauth.callback_port` (or the global
+`mcp_oauth_callback_port`) and the matching saved `oauth.callback_url`; verify
+the effective URI after discovery. If choosing variable loopback ports instead,
+prove RFC 8252 port handling with the provider while keeping host/path matching
+strict. Never solve a callback mismatch with a broad redirect wildcard.
+
+For Codex CLI, persist the requested scopes in `mcp_servers.<name>.scopes`;
+`codex mcp login <name> --scopes openid,profile,email,offline_access,netbox-mcp`
+can override them for one login. For each other client, record the effective
+requested scopes and verify that metadata/configuration yields the same required
+authorization and refresh capabilities. Keep secrets in private client storage,
+never in checked-in examples, shell transcripts or shared project settings.
+
+Hosted clients need a reachable MCP endpoint and provider discovery/token/JWKS
+endpoints; the user's workstation having VPN access is not sufficient. Test from
+the actual hosted client and the actual CLI environment, including applicable
+workspace permissions, firewall/proxy rules and certificate validation. The
+common deployment path is externally reachable HTTPS; provider-specific tunnels
+are a separate deployment option and do not establish cross-client reachability.
+
+Each of the four clients must pass its own initial login, tool discovery, read,
+permitted disposable write with human attribution, access-token refresh without
+interactive login, reconnect/restart, and policy/token-revocation tests. Record
+client version or hosted test date, exact callback, scopes, token-endpoint auth
+method, resource/audience results and safe evidence in private pilot records.
+No client is marked supported until its entire acceptance row passes.
+
 ## 4. JWT and HTTP authentication
 
 Enable OIDC only with HTTP token passthrough and complete OIDC configuration.
@@ -123,9 +203,10 @@ Exactly three nonempty base64url segments select the JWT path. All other
 tokens use existing NetBox passthrough, including legacy alphanumeric tokens
 and v2 `nbt_<key>.<token>` values. A rejected JWT never falls back to passthrough.
 
-Validate RS256, signature, exact issuer, audience, expiration, optional `nbf`,
-required scope, `azp`, required group and a nonempty subject/username. Require
-`exp`, `iss`, `aud` and `sub`; check claim types before using them. An ID token
+Validate RS256, signature, exact issuer, MCP resource audience, expiration,
+optional `nbf`, required scope, `azp` equal to `OIDC_CLIENT_ID`, required group
+and a nonempty subject/username. Require `exp`, `iss`, `aud` and `sub`; check
+claim types before using them. An ID token
 must fail the access-token contract even when its audience matches.
 
 Fetch JWKS from configured `OIDC_JWKS_URL`, or discover `jwks_uri` through the
@@ -148,7 +229,11 @@ Publish protected-resource metadata at both:
 Set `resource` to the configured public MCP URL, `authorization_servers` to the
 issuer, `bearer_methods_supported` to `["header"]`, and advertise the configured
 scopes. Authentication 401 responses include the corresponding
-`WWW-Authenticate: Bearer resource_metadata="..."` challenge.
+`WWW-Authenticate: Bearer resource_metadata="...",
+scope="openid profile email offline_access netbox-mcp"` challenge (one header);
+advertise the same requested scope set in resource metadata. Keep the required
+API scope separate from OIDC scopes used for login and refresh. Explicit client
+scope configuration must include `offline_access` for the refresh acceptance test.
 
 The verified request carries `AccessToken(token=<personal NetBox token>,
 client_id="user:<NetBox user ID>", scopes=[])`. If the selected auth provider
@@ -289,8 +374,11 @@ OIDC client leases, avoiding recursive broker acquisition.
 ## 9. Configuration and operational responsibilities
 
 Keep existing behavior when `OIDC_ISSUER` is unset. When configured, require
-`OIDC_AUDIENCE`, `OIDC_REQUIRED_GROUP`, `MCP_PUBLIC_URL`,
+`OIDC_AUDIENCE`, `OIDC_CLIENT_ID`, `OIDC_REQUIRED_GROUP`, `MCP_PUBLIC_URL`,
 `NETBOX_TOKEN_BROKER_TOKEN` and `TOKEN_ENCRYPTION_KEY`.
+Fail startup unless `OIDC_AUDIENCE` equals the canonical `MCP_PUBLIC_URL` and
+`OIDC_CLIENT_ID` is nonempty. Keep the client identity and resource settings
+distinct; changing an identifier requires coordinated provider/client rollout.
 
 Optional settings are `OIDC_REQUIRED_SCOPE` (default `netbox-mcp`),
 `OIDC_USERNAME_CLAIM` (default `preferred_username`), `OIDC_JWKS_URL`, and
@@ -325,6 +413,11 @@ with disposable accounts before removing any MCP delete-tool restriction.
 
 ## 10. Reference contracts
 
+- [Claude remote connector setup and network requirements](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+- [Claude Code OAuth credentials and callbacks](https://code.claude.com/docs/en/mcp#use-pre-configured-oauth-credentials)
+- [ChatGPT MCP authentication, resource binding and PKCE](https://developers.openai.com/plugins/build/auth)
+- [Codex CLI MCP registration, callbacks and scopes](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
+- [ChatGPT custom MCP setup and workspace requirements](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt)
 - [NetBox token model](https://github.com/netbox-community/netbox/blob/v4.7.3/netbox/users/models/tokens.py)
 - [NetBox token serializer](https://github.com/netbox-community/netbox/blob/v4.7.3/netbox/users/api/serializers_/tokens.py)
 - [NetBox grant constraint evaluation](https://github.com/netbox-community/netbox/blob/v4.7.3/netbox/users/utils.py)

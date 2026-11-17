@@ -10,6 +10,10 @@ and measured integration results in private deployment records.
 This plan covers client validation, package implementation, container release,
 deployment, recovery and optional permission hardening. It does not depend on
 a particular reverse proxy, container manager, DNS service or organization.
+The required client surfaces are claude.ai, direct Claude Code, chatgpt.com and
+direct Codex CLI, all using Streamable HTTP. Passing one client does not establish
+support for the others. Use the setup matrix in design section 3 and record
+actual client versions/hosted test dates privately.
 
 ## Working rules
 
@@ -37,20 +41,47 @@ a particular reverse proxy, container manager, DNS service or organization.
   tool returning selected identity/policy claims, never the bearer token.
 - [ ] Require the test group and the intended scope. Configure the scope mapping
   to emit `groups` under the same required scope; verify claim inclusion settings.
+- [ ] Configure authorization-code and refresh grants with PKCE S256. Disable
+  unused grants and advertise the actual token-endpoint auth methods. Verify
+  discovery includes `code_challenge_methods_supported` with `S256` and all
+  requested scopes, including `offline_access`.
+- [ ] Enforce the exact MCP resource audience separately from the registration's
+  client ID/authorized party. Exercise real authorization and token requests with
+  `resource`; do not assume the reference provider supports this contract.
 - [ ] Expose the temporary MCP route and protected-resource metadata through
   narrowly scoped host **and** path rules. Choose a deployment-specific available
   listener rather than embedding an infrastructure address in the repository.
 - [ ] Record exact client callback URLs and register strict redirect matches.
+- [ ] Configure all four clients using pre-registered credentials. For claude.ai,
+  select the own-client option; for ChatGPT, copy the connection's displayed
+  callback and verify workspace/tool permissions. For Claude Code and Codex CLI,
+  configure their direct HTTP connections and effective loopback listener ports.
+  Follow the version/issuer-dependent callback rules in design section 3.
+- [ ] Set the requested scopes to `openid profile email offline_access netbox-mcp`
+  through client configuration or discovery/challenge metadata and inspect the
+  resulting request. Keep credentials outside shared project configuration.
 - [ ] Verify unauthenticated 401 challenge, public metadata, issuer discovery,
   ordinary application paths and unrelated-host routing, through both internal
   routing and any external edge. Record the pre-change baseline for rollback.
 
-### Task 2: client and denial matrix
+### Task 2: client, protocol and denial matrix
 
-- [ ] For every intended client, connect using its supported fixed-client OAuth
-  configuration and prove a successful `whoami` call and refresh after expiry.
+- [ ] For each of the four required clients, prove initial login, tool discovery,
+  a successful `whoami` call, refresh after real access-token expiry without an
+  interactive login, and reconnect/restart using the stored credentials.
 - [ ] Record discovery URLs, issuer matching, `aud`, `azp`, `scope`, `groups`,
-  `sub`, callback URLs and the handling of the `resource` parameter privately.
+  `sub`, callbacks, client versions/test dates, token-endpoint auth method and
+  `resource` handling privately. Record redacted evidence, never bearer values,
+  authorization codes, refresh tokens or secrets.
+- [ ] Verify PKCE S256 is sent and enforced. Negative protocol probes must deny
+  missing/non-S256 challenges, missing/wrong verifiers, mismatched redirects and
+  invalid client credentials.
+  Check advertised response-issuer support against actual `iss` responses;
+  issuer-bound clients must reject missing or mismatched response issuers.
+- [ ] Prove the correct resource produces the expected MCP audience, including
+  after refresh. A wrong resource must fail issuance or yield a token rejected
+  by MCP; a client-ID-only audience must also be rejected. No negative case may
+  mint a personal NetBox token. Confirm refresh cannot broaden scopes.
 - [ ] Check actual ID-token rejection separately from access-token acceptance.
 - [ ] Measure account deactivation, group removal and application-binding denial
   independently, starting each case with a working test identity.
@@ -64,6 +95,22 @@ a particular reverse proxy, container manager, DNS service or organization.
   clock tolerance. Evaluate online policy checks or a different architecture
   based on evidence rather than assuming refresh or UserInfo semantics.
 
+Keep an acceptance table in the private pilot record with these four rows.
+All cells begin as pending; do not fill them from documentation or unit tests.
+Phase A fills login/discovery, refresh, reconnect and identity-provider denial.
+Task 15 fills the final workload tests and repeats the earlier checks.
+
+| Client | Version/date, callback, scopes and auth method | Login/discovery | Read/write and attribution | Refresh | Reconnect/restart | IdP denial | NetBox revocation |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| claude.ai | Pending | Pending | Pending | Pending | Pending | Pending | Pending |
+| Claude Code (direct HTTP) | Pending | Pending | Pending | Pending | Pending | Pending | Pending |
+| chatgpt.com | Pending | Pending | Pending | Pending | Pending | Pending | Pending |
+| Codex CLI (direct HTTP) | Pending | Pending | Pending | Pending | Pending | Pending | Pending |
+
+Attach protocol-probe evidence for PKCE, issuer validation, resource binding,
+ID-token rejection and token-endpoint authentication to this record. The shared
+provider tests supplement, rather than replace, the per-client flow checks.
+
 ### Task 3: tear down the experiment
 
 - [ ] Remove temporary routing, edge exceptions, workload, clients and provider
@@ -76,6 +123,11 @@ a particular reverse proxy, container manager, DNS service or organization.
 
 - [ ] Confirm the fixed-client design works in all target clients and denial
   times meet the stated policy. Record an explicit deployment-owner decision.
+- [ ] Require all four Phase A acceptance rows and the protocol probes to pass.
+  Resource binding, PKCE S256, refresh and exact callbacks are blocking criteria.
+  If the provider cannot issue resource-bound access tokens, stop and revise
+  the integration or architecture before package implementation. Do not accept
+  client-ID-only audiences as a compatibility exception or add a proxy silently.
 - [ ] If provider behavior changes the design, update this design and plan before
   implementing. Do not proceed with mocks that contradict measured behavior.
 
@@ -90,6 +142,9 @@ Files: `pyproject.toml`, `uv.lock`, `src/netbox_mcp/oidc/config.py`,
   Ensure the container's locked dependency installation succeeds.
 - [ ] Implement immutable configuration with the required/optional environment
   variables in the design. Validate URLs, key format and incompatible auth modes.
+- [ ] Require a separate nonempty `OIDC_CLIENT_ID` for `azp` validation and require
+  `OIDC_AUDIENCE == MCP_PUBLIC_URL`. Test mismatched resource configuration and
+  prevent a client-ID audience from being substituted for the MCP resource.
 - [ ] Test issuer-unset behavior, missing required settings, defaults, issuer URL
   handling, empty required policy values and invalid encryption keys.
 - [ ] Keep no-OIDC behavior unchanged. Reject OIDC with static shared bearer
@@ -121,6 +176,8 @@ class AuthentikJwtVerifier:
 
 - [ ] Implement RS256-only validation with required claims, issuer/audience,
   temporal checks, group, scope, subject/username types and authorized party.
+  Accept `aud` as the exact MCP resource string or a string array containing it;
+  compare `azp` separately with `OIDC_CLIENT_ID`. Reject malformed audience types.
 - [ ] Inject wall and monotonic clocks independently. Implement a 300-second
   JWKS maximum age, full key-set replacement, shared concurrent refresh and
   60-second throttling of unknown-key/failed-fetch attempts.
@@ -129,6 +186,10 @@ class AuthentikJwtVerifier:
 - [ ] Cover valid access tokens, ID tokens, missing/malformed claims, expiry,
   future `nbf`, wrong issuer/audience/party/group/scope, HS256/none, foreign
   signature with the same `kid`, and v1/v2 passthrough classification.
+- [ ] Include tokens with only the client-ID audience, tokens for another MCP
+  resource and valid resource tokens from the wrong authorized party. Each must
+  fail before broker access. Test real-provider-shaped access/ID-token fixtures
+  with generated test keys, based on the Phase A contract rather than assumptions.
 - [ ] Cover known-key expiry, removed keys, full replacement versus merge,
   fetch outage at/after 300 seconds, unknown-key throttling and concurrent
   refresh. Removed known keys must fail without restarting the process.
@@ -226,6 +287,9 @@ Files: `src/netbox_mcp/oidc/composite.py`, `src/netbox_mcp/oidc/leases.py`,
 
 - [ ] Build the composite verifier and metadata/challenge responses. Reject bad
   JWTs without passthrough fallback. Preserve NetBox passthrough and its 503 errors.
+- [ ] Use one canonical MCP URL for the metadata resource, configured audience
+  and middleware resource. Advertise the design's complete login/refresh scope
+  set in initial challenges and resource metadata; enforce the API scope in JWTs.
 - [ ] Populate the verified access token with a personal token, stable NetBox
   user client ID and a server-owned OIDC-mode marker. Include any resource field
   required by the selected auth middleware without breaking passthrough.
@@ -251,6 +315,10 @@ dispatch, with mocked NetBox/JWKS only:
 
 - [ ] Both metadata routes, 401 challenge, invalid JWT, missing required group,
   no-OIDC compatibility and passthrough outage/permission behavior.
+- [ ] Accept the correct resource and authorized party. Reject wrong resource,
+  client-ID-only audience and wrong `azp` with HTTP 401 and metadata challenge;
+  no personal-token issuance on rejection.
+  Check exact resource and requested scopes in both metadata and initial challenge.
 - [ ] Deletion/deactivation discovered on the first tool call: tool error first,
   HTTP 403 on the next request; exactly one inventory request was sent.
 - [ ] Object-permission denial followed by a permitted operation still works.
@@ -301,9 +369,14 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 
 - [ ] Apply the measured provider settings: dedicated client, strict callbacks,
   stable subject, signing key, lifetimes, group binding and mapped claims.
-- [ ] Verify discovery, exact issuer, JWKS and required scopes.
+- [ ] Apply the proven resource binding, PKCE S256, grant restrictions and
+  token-endpoint auth methods. Register the four measured callbacks, including
+  the CLI port/path details; verify supported response-issuer behavior.
+- [ ] Verify discovery, exact issuer, JWKS and required scopes, including
+  advertised `offline_access` and actual refresh-token issuance.
 - [ ] Verify actual access tokens contain the expected group/scope/party and
-  that an ID token does not pass the API-token contract.
+  MCP resource audience, that refresh preserves that contract, and that an ID
+  token does not pass the API-token contract.
 - [ ] Keep the client secret in approved client/provider configuration only;
   document its rotation process in the private runbook.
 
@@ -327,17 +400,28 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
   policy. Combine host and path restrictions, including on shared frontends.
 - [ ] Verify both metadata routes through internal and external paths; check
   that unrelated paths and unrelated hosts retain their previous behavior.
+- [ ] Verify the MCP endpoint on HTTPS port 443 from claude.ai and chatgpt.com,
+  and from both direct CLI environments. Verify provider discovery, authorization,
+  token and JWKS reachability from their respective consumers; workstation VPN
+  reachability alone is insufficient evidence for hosted clients.
 - [ ] Roll back exactly the changed routing conditions from the snapshot rather
   than deleting shared rules or DNS records.
 
 ### Task 15: pilot and recovery acceptance
 
-- [ ] Connect a limited pilot user in each supported client. Prove read access,
-  a permitted write to a disposable object, and correct user attribution.
+- [ ] Complete all four rows of the Task 2 acceptance matrix against the deployed
+  workload. For each client, prove tool discovery, read access, a permitted write
+  to a disposable object and correct human-user attribution. No client may pass
+  using another client's connector or a manually injected personal NetBox token.
+- [ ] Repeat login, refresh after access-token expiry without interactive login,
+  reconnect/restart and all three IdP-denial cases in each client. Verify the
+  actual token-endpoint auth method, resource/audience and scope behavior.
 - [ ] Test token deletion, token deactivation and deactivation within the renewal
-  window; keep test expiry consistent in NetBox and the broker's test record.
-- [ ] Test genuine object denial followed by a permitted operation. Capture only
-  safe status/error metadata, never credentials.
+  window in each client; keep test expiry consistent in NetBox and the broker's
+  test record. Verify denial persists after reconnect/refresh and no replacement
+  token bypasses the lock. Restore each disposable test identity between cases.
+- [ ] In every client, test genuine object denial followed by a permitted
+  operation. Capture only safe status/error metadata, never credentials.
 - [ ] Verify controlled unlock/retirement and distinguish it from unresolved
   issuance recovery. An unlock must not erase an open issuance attempt.
 - [ ] Provide a private runbook for emergency shutdown, broker-token rotation,
@@ -355,6 +439,10 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
   audience after pilot acceptance.
 - [ ] Publish user guidance for connecting, first-login prerequisites, permission
   errors, revocation support, personal attribution and existing passthrough use.
+- [ ] Include separate setup instructions for claude.ai, Claude Code, chatgpt.com
+  and Codex CLI, with tested versions/dates, generic scope/callback examples and
+  private secret-storage guidance. Explain the shared registration's rotation
+  impact and client-secret limitations on local machines.
 - [ ] Record deployment version, validation and ownership in the organization's
   private change/service records, without copying those records into this repository.
 
@@ -385,7 +473,8 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 
 ## Completion criteria
 
-The work is complete only when package and integration tests pass, each target
-client passes the pilot, revocation/renewal/cleanup races are covered, recovery
+The work is complete only when package and integration tests pass, all four
+named clients pass every pilot acceptance column and the PKCE/resource/issuer
+protocol probes pass, revocation/renewal/cleanup races are covered, recovery
 has been exercised, and operators have the required private runbooks. Publishing
 this plan or building an image alone does not establish production readiness.
