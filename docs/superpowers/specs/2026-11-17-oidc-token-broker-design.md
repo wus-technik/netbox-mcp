@@ -2,7 +2,7 @@
 
 Status: proposed design; implementation and integration tests are outstanding.
 
-Implementation plan: [OIDC token broker implementation](../plans/oidc-token-broker.md).
+Implementation plan: [OIDC token broker implementation](../plans/2026-11-17-oidc-token-broker.md).
 Code baseline: upstream `v0.3.0`. The repository lockfile selects FastMCP 4.1.6
 and MCP Python SDK 2.3.0. NetBox 4.7.3 and Authentik 2026.8.5 are reference
 versions for the API contracts below, not an inventory of any deployment.

@@ -2,7 +2,7 @@
 
 Status: proposed work, not an implemented or verified feature.
 
-Design: [OIDC authentication with personal NetBox tokens](../design/oidc-token-broker.md).
+Design: [OIDC authentication with personal NetBox tokens](../specs/2026-11-17-oidc-token-broker-design.md).
 Start implementation from upstream `v0.3.0`. Reference API versions and all
 security/lifecycle contracts are defined in the design. Keep operational values
 and measured integration results in private deployment records.
