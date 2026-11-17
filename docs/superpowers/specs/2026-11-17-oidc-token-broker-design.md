@@ -28,6 +28,14 @@ Existing NetBox-token passthrough remains available on the same MCP endpoint.
 Passthrough is authorized by NetBox, independently of the OIDC application.
 Revoking OIDC access does not revoke separately issued NetBox API tokens.
 
+**Compliance exception:** the MCP authorization specification (2025-06-18 and
+2025-11-25) forbids accepting and forwarding tokens that were not issued for the
+MCP server. NetBox-token passthrough does exactly that. It is an existing,
+intentional compatibility mode, not part of the OIDC contract. Document it as an
+explicit exception and let operators turn it off while OIDC is enabled
+(`OIDC_ACCEPT_NETBOX_TOKENS=false`, default `true`). Never describe a filled
+`AccessToken.resource` on a passthrough request as resource binding.
+
 Excluded from the initial implementation:
 
 - Dynamic client registration and an OAuth authorization proxy.
@@ -91,8 +99,21 @@ requires an explicit issuer/client allowlist design before deployment; do not
 silently broaden the verifier to accept arbitrary clients.
 
 Require authorization-code flow with **PKCE S256**, including for confidential
-clients. Discovery must advertise `code_challenge_methods_supported: ["S256"]`
-and the supported `token_endpoint_auth_methods_supported`. Record and test the
+clients. Discovery must advertise `code_challenge_methods_supported` **including**
+`S256`, and the supported `token_endpoint_auth_methods_supported`. Advertising
+`plain` alongside is tolerated only if the negative probes below prove that the
+provider rejects it. Enforcement is proven by those probes, not by discovery.
+
+The reference Authentik version advertises `plain` and `S256`, accepts an
+authorization request without a challenge, and checks the verifier only when a
+challenge was recorded (per review of its source; confirm in Phase A). Provider
+configuration alone therefore does not enforce S256. For Authentik, bind an
+expression policy to the application's authorization flow that denies requests
+without a nonempty `code_challenge` or with a `code_challenge_method` other than
+`S256`. Phase A must prove that such a policy can read the authorization request
+parameters; if it cannot, S256 enforcement fails the gate until the provider
+supports it natively (see "Upstream status" below). Other providers need an
+equivalent, tested enforcement. Record and test the
 actual method selected by each client (for example `client_secret_basic` or
 `client_secret_post`), both at code exchange and refresh. Reject authorization
 without an S256 challenge, an absent or incorrect PKCE verifier, and a code
@@ -116,6 +137,25 @@ one active NetBox user, then persist the NetBox user ID. Subsequent logins follo
 that ID, including after a username change. Missing or ambiguous mappings deny
 access; a deleted user must not be reassigned through a reused username.
 
+A unique match proves uniqueness in NetBox, not that the OIDC subject owns the
+account. OIDC makes no stability or uniqueness promise for `preferred_username`.
+First-login linking is therefore only safe under these preconditions:
+
+- **Operator-controlled namespace (deployment precondition):** only
+  administrators can set or change the username claim in the provider. Users must
+  not be able to edit their own username (in Authentik: no self-service username
+  change in the user settings flow, and no enrollment flow that lets users choose
+  a name matching an existing NetBox account). The provider's username and the
+  NetBox username must come from the same administered source, for example the
+  same directory. Document this as a required deployment setting and verify it in
+  Phase A.
+- **One identity per NetBox user:** at most one active `(iss, sub)` may link to a
+  given NetBox user ID (a store uniqueness constraint, see section 6). A first
+  login whose username resolves to a NetBox user already linked to a different
+  subject is denied and audited. It is never relinked automatically. Relinking
+  (for example after a provider account was recreated) is an explicit
+  administrative action that retires the old identity and its tokens first.
+
 The canonical resource identifier is the exact `MCP_PUBLIC_URL`, initially
 `https://inventory.example.com/mcp`. Require `OIDC_AUDIENCE` to equal that value;
 the access token's `aud` must be that string or a string array containing it.
@@ -128,7 +168,18 @@ be rejected or receive a token unusable at this MCP endpoint. Refresh must
 preserve the audience and authorized party without broadening scopes. Reject
 tokens containing only the client-ID audience, even if their signature, group
 and scope are otherwise valid. ID tokens remain intended for the OAuth client
-and must not be accepted as MCP access tokens.
+and must not be accepted as MCP access tokens. Section 4 defines the criterion
+that tells them apart; Phase A must confirm it with real tokens.
+
+**Authorization-server metadata discovery.** The reference issuer has a path and
+a trailing slash. RFC 8414 places metadata at the path-inserted form
+`https://identity.example.com/.well-known/oauth-authorization-server/application/o/inventory-mcp/`,
+while Authentik serves only the appended OIDC form
+`https://identity.example.com/application/o/inventory-mcp/.well-known/openid-configuration`.
+Under MCP 2025-11-25, clients try the path-inserted OAuth and OIDC forms first
+and the appended OIDC form last. Phase A must record, per client, which URL it
+fetched, that it accepted the metadata, and that the returned `issuer` matched
+the configured issuer exactly, including the trailing slash.
 
 **Provider gate:** do not assume the reference Authentik version can implement
 this resource contract. Prove it with real authorization, exchange and refresh
@@ -136,6 +187,46 @@ requests before implementing the broker. If it cannot, stop Phase A and revise
 the provider integration or architecture. An OAuth proxy remains outside the
 initial scope; introducing one requires a revised design. A successful login
 with a client-ID-only audience does not pass this gate.
+
+This gate is expected to fail for the reference provider (see "Upstream status"
+below). Decide in advance which fallback to evaluate if it fails, so that the
+gate leads to a quick decision instead of an open-ended investigation:
+
+1. Wait for native provider support. For Authentik, both RFC 8707 resource
+   binding and PKCE enforcement are targeted at release 2027.2.0, but not merged.
+2. A different identity provider that issues resource-bound access tokens and
+   enforces PKCE S256.
+3. A revised design with a narrowly scoped OAuth proxy (out of scope here).
+
+Not acceptable as fallbacks:
+
+- **Authentik token exchange (RFC 8693, since 2026.8.0).** Its `audience`
+  parameter accepts only a target provider's client ID or application UUID, so
+  the issued `aud` is a client ID, not the MCP resource URI; `resource` is
+  rejected with `invalid_target`.
+- **Returning `aud` from a scope mapping.** The same claims feed the ID token, so
+  the mapping also overwrites the ID token's `aud` (confirmed upstream bug). The
+  documented workaround `["<resource>", client_id]` puts the resource into the ID
+  token's audience as well, which removes the separation this design relies on.
+
+### Upstream status (Authentik, checked 2026-11-17)
+
+Latest release at the time of checking: 2026.8.5; 2026.11.0 is not yet tagged
+and contains none of the items below. Recheck before Phase A.
+
+| Topic | Upstream item | Status |
+| --- | --- | --- |
+| RFC 8707 resource indicators, access-token `aud` = resource | [Issue #27645](https://github.com/goauthentik/authentik/issues/27645), [PR #27855](https://github.com/goauthentik/authentik/pull/27855) | Issue open, milestone 2027.2.0. PR open, under review: `resource` on authorize/token, per-provider allowed resources, `aud` from the grant, refresh can only narrow. |
+| MCP client support (CIMD, public MCP clients) | [Issue #27431](https://github.com/goauthentik/authentik/issues/27431), [Issue #27564](https://github.com/goauthentik/authentik/issues/27564) | Open, milestone 2027.2.0; #27645 is a sub-issue. |
+| Require PKCE / S256 only | [Issue #25520](https://github.com/goauthentik/authentik/issues/25520), [PR #27884](https://github.com/goauthentik/authentik/pull/27884) | Issue open, milestone 2027.2.0. PR is a draft: `pkce_mode` (optional / public clients / all) and `pkce_allow_plain`; discovery then advertises only S256. |
+| RFC 9068 access tokens (`typ: at+jwt`, resource `aud`, `client_id`) | [Issue #22070](https://github.com/goauthentik/authentik/issues/22070) | Open, milestone "Future release", no PR. Access tokens carry no `typ` header today. |
+| Scope-mapping `aud` overwrites ID-token `aud` | [Issue #25235](https://github.com/goauthentik/authentik/issues/25235) | Open, confirmed bug, milestone 2027.2.0. |
+| Audience for resource-server protection | [Issue #14545](https://github.com/goauthentik/authentik/issues/14545) | Closed 2026-11-04 in favour of #22070; maintainers point to token exchange in the meantime. |
+
+Consequences for this design: with released Authentik versions the provider
+gate fails on resource binding and, unless the expression policy works, on PKCE
+enforcement. Of today's Authentik tokens, only the access token carries a `scope`
+claim, which matches rule 2 of the ID-token criterion in section 4.
 
 Measure removal from the application binding, removal from the required group,
 and account deactivation separately. Acceptance requires denial of newly issued
@@ -163,7 +254,7 @@ imported claude.ai connector in Claude Code as a test of its own OAuth client.
 | claude.ai | Custom remote connector; choose the existing/own OAuth client and supply its ID and secret. Allow connections from the hosted service to HTTPS port 443. | Register `https://claude.ai/api/mcp/auth_callback`. |
 | Claude Code | Direct HTTP MCP server with `--client-id`, masked `--client-secret` input and `--callback-port`; authenticate with `claude mcp login` or `/mcp`. | Register the exact loopback URI sent by the tested version, normally `http://localhost:PORT/callback`; match the configured listener port. Version 2.1.229 used `127.0.0.1`; 2.1.231 restored `localhost`. |
 | chatgpt.com | Custom MCP app/plugin with a predefined OAuth client in an account/workspace that permits the required read and write tools. | Copy the exact redirect from its management page. Depending on issuer support and connection history, it can be `https://chatgpt.com/connector/oauth/{callback_id}` or `https://chatgpt.com/connector_platform_oauth_redirect`. |
-| Codex CLI | Direct Streamable HTTP server with `--oauth-client-id` and the pre-registered secret configured privately; authenticate with `codex mcp login`. CLI 0.169.0 exposes the required flags; this is not a tested minimum version. | Register the callback displayed by `codex mcp add`. Preserve any server-specific callback suffix; configure the listener port separately from the callback URL. |
+| Codex CLI | Direct Streamable HTTP server with `--oauth-client-id` and the pre-registered secret configured privately; authenticate with `codex mcp login`. CLI 0.169.0 exposes the required flags; this is not a tested minimum version. Do not pass the secret with `--oauth-client-secret` on a command line, where it reaches shell history and process listings; set it through a private configuration file or a prompt and record the method used. | Register the callback displayed by `codex mcp add`. Preserve any server-specific callback suffix; configure the listener port separately from the callback URL. |
 
 For Claude Code, choose an available fixed callback port before registering the
 URI. For Codex CLI, use `mcp_servers.<name>.oauth.callback_port` (or the global
@@ -195,22 +286,66 @@ No client is marked supported until its entire acceptance row passes.
 
 ## 4. JWT and HTTP authentication
 
-Enable OIDC only with HTTP token passthrough and complete OIDC configuration.
-Reject conflicting static bearer authentication or unsupported transports at
-startup rather than silently changing authentication mode.
+Enable OIDC only with `MCP_TRANSPORT=http` (Streamable HTTP),
+`NETBOX_TOKEN_PASSTHROUGH=true` and complete OIDC configuration. stdio and SSE
+are unsupported with OIDC. Reject conflicting static bearer authentication
+(`MCP_HTTP_BEARER_TOKEN`) or another transport at startup rather than silently
+changing authentication mode.
 
 Exactly three nonempty base64url segments select the JWT path. All other
 tokens use existing NetBox passthrough, including legacy alphanumeric tokens
 and v2 `nbt_<key>.<token>` values. A rejected JWT never falls back to passthrough.
+With `OIDC_ACCEPT_NETBOX_TOKENS=false`, non-JWT bearer values are rejected with
+401 instead of being passed through.
 
 Validate RS256, signature, exact issuer, MCP resource audience, expiration,
 optional `nbf`, required scope, `azp` equal to `OIDC_CLIENT_ID`, required group
 and a nonempty subject/username. Require `exp`, `iss`, `aud` and `sub`; check
-claim types before using them. An ID token
-must fail the access-token contract even when its audience matches.
+claim types before using them.
 
-Fetch JWKS from configured `OIDC_JWKS_URL`, or discover `jwks_uri` through the
-configured issuer. Cache keys for at most **300 seconds**, measured with a
+**Clock tolerance:** one leeway of 60 seconds applies to `exp`, `nbf` and `iat`
+in the JWT verifier and to the `expires_at` derived from `exp`. The SDK's bearer
+middleware compares `expires_at` without leeway, so set
+`expires_at = exp + leeway`. Test both checks with injected clocks through the
+real SDK dispatch.
+
+**Access token versus ID token.** An ID token must fail the access-token contract
+even when its audience matches. Criterion, in this order:
+
+1. If the JOSE header `typ` is `at+jwt` (RFC 9068), the token is an access token.
+   If `typ` is present with any other value except `JWT`, reject it.
+2. Otherwise require a `scope` claim (space-separated string) containing the
+   required API scope. ID tokens carry no `scope` claim.
+3. Reject any token carrying `nonce` or `at_hash`, which are ID-token claims.
+
+Phase A must confirm with real provider tokens that this rule accepts every
+access token and rejects every ID token. If the provider's tokens cannot be told
+apart this way, update the rule before implementation.
+
+**Typed rejection:**
+
+| Failure | HTTP response |
+| --- | --- |
+| Malformed, bad signature, wrong issuer/audience/party, expired, ID token, unknown `kid` in a fresh key set | 401 with metadata challenge |
+| Valid token without the required scope | 403 with `WWW-Authenticate: Bearer error="insufficient_scope", scope="...", resource_metadata="..."` |
+| Valid token, required group missing | 403 |
+| Broker denial (locked identity, unknown or conflicting mapping, inactive user) | 403 |
+| JWKS beyond maximum age, broker or NetBox dependency outage | 503 with `Retry-After` |
+
+The error handler that renders these responses (today `auth_error_response`,
+installed by `NetBoxTokenVerifier.get_middleware()`) must be installed on the
+**outermost** provider's `AuthenticationMiddleware`. If the composite verifier
+is wrapped in another FastMCP provider, that provider's middleware is the one
+used. A regression test must prove the existing passthrough 503 still works
+after composition.
+
+**JWKS location.** Fetch JWKS from configured `OIDC_JWKS_URL`. If unset, fetch
+the provider configuration from `OIDC_ISSUER` with
+`.well-known/openid-configuration` appended (issuer with trailing slash kept,
+joined without a double slash). Require the returned `issuer` to equal
+`OIDC_ISSUER` exactly, including the trailing slash, and take `jwks_uri` from it.
+Discovery failure at startup is fatal; later failures follow the JWKS cache rules
+below. Cache keys for at most **300 seconds**, measured with a
 monotonic clock. Check age even for a known `kid`. On expiry, wait for a shared
 refresh before accepting more tokens. Replace key sets completely; do not
 merge removed keys back into the cache.
@@ -235,12 +370,31 @@ advertise the same requested scope set in resource metadata. Keep the required
 API scope separate from OIDC scopes used for login and refresh. Explicit client
 scope configuration must include `offline_access` for the refresh acceptance test.
 
-The verified request carries `AccessToken(token=<personal NetBox token>,
-client_id="user:<NetBox user ID>", scopes=[])`. If the selected auth provider
-enforces a resource field, populate it consistently for both accepted modes.
-Metadata scopes do not replace the explicit JWT checks. Preserve existing
-passthrough availability errors and ensure the chosen FastMCP middleware can
-return 403 for broker denials and 503 for dependency outages.
+The verified request carries:
+
+```python
+AccessToken(
+    token=<personal NetBox token>,
+    client_id="user:<NetBox user ID>",
+    scopes=[],
+    expires_at=<JWT exp + leeway>,
+    claims={"netbox_mcp_auth_mode": "oidc", "iss": ..., "sub": ...},
+)
+```
+
+`claims` is built by the server from verified values only; the input JWT's claims
+are never copied into it wholesale, so a JWT cannot inject the mode marker.
+Passthrough requests carry `netbox_mcp_auth_mode="passthrough"`. If the selected
+auth provider enforces a resource field, populate it consistently for both
+accepted modes. Confirm the field names against the locked FastMCP version
+before implementation. Metadata scopes do not replace the explicit JWT checks.
+
+**JWT library.** Use PyJWT (with `cryptography`), which is already locked as a
+transitive dependency of the MCP SDK; declare both directly. FastMCP's own JWT
+verifier (joserfc/authlib) is not used because the verifier needs the bounded
+JWKS cache, the ID-token rule and typed errors above, which its built-in verifier
+does not offer. Two JOSE libraries in the image are an accepted cost; revisit if
+FastMCP's verifier gains these hooks.
 
 ## 5. NetBox service permissions
 
@@ -266,6 +420,16 @@ description containing the generic prefix `NetBox MCP (OAuth)` plus a unique
 issuance nonce. Assemble the full v2 bearer value from the creation response;
 store only its encrypted form.
 
+**Broker API client.** Broker calls use a dedicated `NetBoxClient` built with
+the broker token and `retry=False`, and every call passes `use_branch=False`.
+The default client retries non-idempotent requests on 429
+(`src/netbox_mcp/retry.py`), which would send a token-create POST more than once
+and break the one-POST-per-journal-entry rule. With branching enabled, the
+default would also look up the branch and send `X-NetBox-Branch` with the broker
+credential, which lacks those permissions. A 429 on the issuance POST leaves the
+attempt in the state its response proves: a 429 response is definitive
+non-creation and resolves the attempt without a token.
+
 ## 6. Store and issuance state machine
 
 Use SQLite in a persistent volume, WAL mode, transactions, and one process
@@ -277,6 +441,9 @@ The store contains:
 
 - Identity records: issuer, subject, NetBox user ID, observed username, current
   token ID/ciphertext/expiry, creation and last-use times, lock and open attempt.
+  `(iss, sub)` is unique. `netbox_user_id` is unique among non-retired identities
+  (a partial unique index); a conflicting first-time link fails the transaction
+  and is denied, as described in section 3.
 - Generations: token ID, identity, fingerprint, current/pending-delete/deleted
   state, deletion reason and intent timestamp.
 - Issuance attempts: unique nonce, identity, user ID, start time, state,
@@ -309,6 +476,14 @@ definitive evidence that no token was created. Keep unresolved attempts across
 restarts; neither elapsed time nor an unlock clears them. Manual resolution
 requires proof the original server request can no longer commit and a final
 search/cleanup. Preserve resolved attempt history for audit and recovery.
+
+**Considered simplification.** The generation, lease and journal machinery in
+sections 6–8 exists because tokens rotate while requests may still use them and
+because issuance must never duplicate a credential. A simpler lifecycle (never
+rotate a token while any request uses it, accept 90-day tokens without renewal,
+re-issue only after expiry) would remove most of the lease logic but leaves the
+issuance journal necessary. Keep the full design unless the Task 4 gate decides
+otherwise; record that decision in the plan before Phase B.
 
 ## 7. Revocation, renewal and cleanup
 
@@ -354,8 +529,9 @@ completion is not a guarantee that a stateful MCP tool has finished running.
 
 Every OIDC `NetBoxClient` context therefore acquires its own lease before
 building outgoing headers. The verifier sets a server-owned marker
-`netbox_mcp_auth_mode="oidc"` on the verified `AccessToken`; never copy that marker
-from an input JWT. The client uses the SDK's request context to obtain it.
+`netbox_mcp_auth_mode="oidc"` in the verified `AccessToken.claims` (section 4);
+never copy that marker from an input JWT. The client uses the SDK's request
+context to obtain it.
 
 Resolve the authenticated token fingerprint, including retired generations,
 to the identity. Recheck the lock, active user and unresolved work; select and
@@ -371,19 +547,48 @@ their own client context. Stop/await them before releasing the store lock at
 shutdown. Passthrough and explicit internal broker API clients do not acquire
 OIDC client leases, avoiding recursive broker acquisition.
 
+**Server lifecycle.** `server.py` builds the auth provider and `FastMCP` at
+import time, and `fastmcp run` (via `fastmcp.json`) imports the module without
+calling `main()`. Importing the module must therefore have no side effects on the
+store: no lock, no recovery, no background tasks. All of that happens in a
+`FastMCP(lifespan=...)` context:
+
+1. On entry: open the store and take exclusive ownership, run startup recovery
+   and reconciliation, attach the broker to the already constructed verifier,
+   start the reconciliation (60 s) and daily cleanup loops, then yield.
+2. Until the broker is attached, OIDC requests receive 503.
+3. On exit: stop accepting new OIDC authentications, cancel and await the
+   background loops, wait for or release outstanding leases (bounded by a
+   timeout and audited), then close the store and release ownership.
+
 ## 9. Configuration and operational responsibilities
 
 Keep existing behavior when `OIDC_ISSUER` is unset. When configured, require
 `OIDC_AUDIENCE`, `OIDC_CLIENT_ID`, `OIDC_REQUIRED_GROUP`, `MCP_PUBLIC_URL`,
-`NETBOX_TOKEN_BROKER_TOKEN` and `TOKEN_ENCRYPTION_KEY`.
+`NETBOX_TOKEN_BROKER_TOKEN`, `TOKEN_ENCRYPTION_KEY` and `TOKEN_STORE_PATH`
+(example `/data/tokens.db`), plus `MCP_TRANSPORT=http` and
+`NETBOX_TOKEN_PASSTHROUGH=true`.
 Fail startup unless `OIDC_AUDIENCE` equals the canonical `MCP_PUBLIC_URL` and
 `OIDC_CLIENT_ID` is nonempty. Keep the client identity and resource settings
 distinct; changing an identifier requires coordinated provider/client rollout.
+The store path has no default, so the store never lands silently on ephemeral
+container storage. Its parent directory must exist and be writable by the
+runtime user; fail startup otherwise.
 
 Optional settings are `OIDC_REQUIRED_SCOPE` (default `netbox-mcp`),
-`OIDC_USERNAME_CLAIM` (default `preferred_username`), `OIDC_JWKS_URL`, and
-`TOKEN_STORE_PATH` (example `/data/tokens.db`). Use generic defaults and no
-organization-specific names in package code or published examples.
+`OIDC_USERNAME_CLAIM` (default `preferred_username`), `OIDC_JWKS_URL` and
+`OIDC_ACCEPT_NETBOX_TOKENS` (default `true`). Use generic defaults and no
+organization-specific names in package code, class names or published examples.
+
+Settings are read in `netbox_client.py` like the existing ones (an
+`OidcConfig` model and `get_oidc_config_from_env()`), so that
+`tests/test_settings_documented.py` covers them. Every new variable is documented
+in `.env.example` and `README.md`. All OIDC variables are added to
+`REGISTRY_EXCLUDED` and not to `server.json`, because the registry manifest
+configures a local stdio install.
+
+The image runs as UID 10001 and declares no volume. The deployment must mount a
+persistent volume for the store directory, owned by or writable for that UID.
 
 Deployment-specific URLs, object IDs, host addresses, operator identities,
 credentials, session links and actual permission inventories belong in private

@@ -45,6 +45,13 @@ actual client versions/hosted test dates privately.
   unused grants and advertise the actual token-endpoint auth methods. Verify
   discovery includes `code_challenge_methods_supported` with `S256` and all
   requested scopes, including `offline_access`.
+- [ ] Enforce S256 with the expression policy described in design section 3
+  (deny a missing or empty `code_challenge` and any method other than `S256`).
+  Configuration alone does not enforce it on the reference provider; the Task 2
+  negative probes are the evidence.
+- [ ] Verify the username namespace precondition (design section 3): users cannot
+  change their own username claim, and no enrollment flow lets them pick one.
+  Record the provider settings that guarantee this.
 - [ ] Enforce the exact MCP resource audience separately from the registration's
   client ID/authorized party. Exercise real authorization and token requests with
   `resource`; do not assume the reference provider supports this contract.
@@ -60,6 +67,8 @@ actual client versions/hosted test dates privately.
 - [ ] Set the requested scopes to `openid profile email offline_access netbox-mcp`
   through client configuration or discovery/challenge metadata and inspect the
   resulting request. Keep credentials outside shared project configuration.
+  For Codex CLI, do not pass `--oauth-client-secret` on the command line; record
+  the private method used to set the secret.
 - [ ] Verify unauthenticated 401 challenge, public metadata, issuer discovery,
   ordinary application paths and unrelated-host routing, through both internal
   routing and any external edge. Record the pre-change baseline for rollback.
@@ -69,6 +78,10 @@ actual client versions/hosted test dates privately.
 - [ ] For each of the four required clients, prove initial login, tool discovery,
   a successful `whoami` call, refresh after real access-token expiry without an
   interactive login, and reconnect/restart using the stored credentials.
+- [ ] For each client, record which authorization-server metadata URL it fetched
+  (path-inserted OAuth/OIDC forms versus the appended OIDC form, design section 3),
+  whether it accepted the metadata, and that the returned `issuer` matched exactly,
+  including the trailing slash.
 - [ ] Record discovery URLs, issuer matching, `aud`, `azp`, `scope`, `groups`,
   `sub`, callbacks, client versions/test dates, token-endpoint auth method and
   `resource` handling privately. Record redacted evidence, never bearer values,
@@ -83,6 +96,9 @@ actual client versions/hosted test dates privately.
   by MCP; a client-ID-only audience must also be rejected. No negative case may
   mint a personal NetBox token. Confirm refresh cannot broaden scopes.
 - [ ] Check actual ID-token rejection separately from access-token acceptance.
+  Record the JOSE header `typ` and the presence of `scope`, `nonce` and `at_hash`
+  in real access and ID tokens, including after refresh, and confirm the
+  criterion in design section 4 separates them. Update the design if it does not.
 - [ ] Measure account deactivation, group removal and application-binding denial
   independently, starting each case with a working test identity.
 - [ ] For binding denial, snapshot bindings and mode; set `policy_engine_mode=all`
@@ -128,6 +144,15 @@ provider tests supplement, rather than replace, the per-client flow checks.
   If the provider cannot issue resource-bound access tokens, stop and revise
   the integration or architecture before package implementation. Do not accept
   client-ID-only audiences as a compatibility exception or add a proxy silently.
+- [ ] Before Phase A, recheck the upstream items in design section 3 ("Upstream
+  status"). If a provider release with RFC 8707 and PKCE enforcement is
+  available, use it for the experiment.
+- [ ] If the resource-binding gate fails, evaluate the fallbacks named in design
+  section 3 in their stated order (wait for native support, other provider,
+  revised design with a proxy) and record the decision before any further work.
+  Token exchange and scope-mapping `aud` overrides are not acceptable fallbacks.
+- [ ] Decide whether to keep the full lease/generation lifecycle or the simpler
+  lifecycle described in design section 6, and record the decision.
 - [ ] If provider behavior changes the design, update this design and plan before
   implementing. Do not proceed with mocks that contradict measured behavior.
 
@@ -135,13 +160,27 @@ provider tests supplement, rather than replace, the per-client flow checks.
 
 ### Task 5: configuration and dependencies
 
-Files: `pyproject.toml`, `uv.lock`, `src/netbox_mcp/oidc/config.py`,
-`src/netbox_mcp/oidc/__init__.py`, `tests/oidc/test_config.py`.
+Files: `pyproject.toml`, `uv.lock`, `src/netbox_mcp/models.py` (`OidcConfig`),
+`src/netbox_mcp/netbox_client.py` (`get_oidc_config_from_env()`),
+`src/netbox_mcp/oidc/__init__.py`, `tests/oidc/__init__.py`,
+`tests/oidc/test_oidc_config.py`, `.env.example`, `README.md`,
+`tests/test_settings_documented.py` (`REGISTRY_EXCLUDED`).
 
-- [ ] Add PyJWT with crypto support and cryptography; regenerate the lockfile.
-  Ensure the container's locked dependency installation succeeds.
+- [ ] Declare PyJWT with crypto support and cryptography directly (both are
+  already locked transitively); regenerate the lockfile. Ensure the container's
+  locked dependency installation succeeds. Record the library choice as stated
+  in design section 4.
 - [ ] Implement immutable configuration with the required/optional environment
-  variables in the design. Validate URLs, key format and incompatible auth modes.
+  variables in the design, read in `netbox_client.py` like the existing settings
+  so `tests/test_settings_documented.py` finds them. Validate URLs, key format and
+  incompatible auth modes.
+- [ ] Document every new variable in `.env.example` and `README.md`; add all OIDC
+  variables to `REGISTRY_EXCLUDED`, not to `server.json`. The settings test must
+  pass unchanged apart from that set.
+- [ ] Require `MCP_TRANSPORT=http`, `NETBOX_TOKEN_PASSTHROUGH=true` and a
+  `TOKEN_STORE_PATH` whose parent directory exists and is writable. Test stdio,
+  SSE, static bearer token, passthrough off, missing store path and an unwritable
+  store directory as startup failures. Test `OIDC_ACCEPT_NETBOX_TOKENS` parsing.
 - [ ] Require a separate nonempty `OIDC_CLIENT_ID` for `azp` validation and require
   `OIDC_AUDIENCE == MCP_PUBLIC_URL`. Test mismatched resource configuration and
   prevent a client-ID audience from being substituted for the MCP resource.
@@ -164,13 +203,16 @@ class Identity:
     username: str
     azp: str
     groups: tuple[str, ...]
+    exp: int
 
 def looks_like_jwt(token: str) -> bool: ...
 
-class JwtRejected(Exception): ...
-class JwksUnavailable(AuthenticationError): ...
+class JwtRejected(AuthenticationError): ...        # 401 + metadata challenge
+class InsufficientScope(AuthenticationError): ...  # 403 insufficient_scope
+class AccessDenied(AuthenticationError): ...       # 403 (group, broker denial)
+class JwksUnavailable(AuthenticationError): ...    # 503 + Retry-After
 
-class AuthentikJwtVerifier:
+class OidcJwtVerifier:
     async def verify(self, token: str) -> Identity: ...
 ```
 
@@ -178,6 +220,16 @@ class AuthentikJwtVerifier:
   temporal checks, group, scope, subject/username types and authorized party.
   Accept `aud` as the exact MCP resource string or a string array containing it;
   compare `azp` separately with `OIDC_CLIENT_ID`. Reject malformed audience types.
+- [ ] Apply one 60-second leeway to `exp`, `nbf` and `iat`; carry `exp` in
+  `Identity` for `expires_at`.
+- [ ] Implement the access-token/ID-token criterion from design section 4
+  (`typ`, `scope`, `nonce`/`at_hash`). Raise the typed errors from the table in
+  design section 4: missing scope is `InsufficientScope`, missing group is
+  `AccessDenied`, everything else in the token is `JwtRejected`.
+- [ ] Implement JWKS location: `OIDC_JWKS_URL`, or discovery from
+  `OIDC_ISSUER` + `.well-known/openid-configuration` with exact `issuer` match
+  (trailing slash kept). Test URL joining with and without a trailing slash,
+  an issuer mismatch, a missing `jwks_uri` and discovery failure at startup.
 - [ ] Inject wall and monotonic clocks independently. Implement a 300-second
   JWKS maximum age, full key-set replacement, shared concurrent refresh and
   60-second throttling of unknown-key/failed-fetch attempts.
@@ -199,7 +251,9 @@ class AuthentikJwtVerifier:
 Files: `src/netbox_mcp/oidc/store.py`, `tests/oidc/test_store.py`.
 
 - [ ] Implement identity, generation, issuance-attempt and audit tables with the
-  fields and uniqueness constraints in design section 6.
+  fields and uniqueness constraints in design section 6, including the partial
+  unique index on `netbox_user_id` among non-retired identities. Test that a
+  second subject cannot link to an already linked user ID.
 - [ ] Bind Fernet ciphertext to `(iss, sub, netbox_user_id, token_id)` and reject
   swapped/corrupt records. Fail startup if the configured key cannot read state.
 - [ ] Implement transactional `begin_issue`, `complete_issue`,
@@ -237,8 +291,13 @@ class TokenBroker:
     async def daily_cleanup(self) -> None: ...
 ```
 
-- [ ] Use the service credential only for user/token management. Resolve exactly
-  one active user on first login; subsequent requests follow the stored user ID.
+- [ ] Use the service credential only for user/token management, through a
+  dedicated `NetBoxClient(..., token=<broker>, retry=False)` with
+  `use_branch=False` on every call (design section 5). Never reuse the default
+  client factory for broker calls.
+- [ ] Resolve exactly one active user on first login; subsequent requests follow
+  the stored user ID. Deny and audit a first login whose username resolves to a
+  user ID already linked to another subject; never relink automatically.
 - [ ] Issue the full v2 bearer value, with a 90-day personal token lifetime and
   renewal at 14 days. Check existence and enabled state before expiry decisions.
 - [ ] Serialize selection, lease registration, rotation, rejection handling and
@@ -264,6 +323,10 @@ Required regression scenarios:
 | Two concurrent first logins | One token POST |
 | Unknown/inactive/ambiguous user | Denial, no token POST |
 | Same subject, renamed account | Same stored NetBox user ID |
+| Two subjects claim the same NetBox user | Second link denied and audited, no token POST |
+| Username reused after rename by another subject | Denied; first identity keeps its link |
+| 429 on the issuance POST | Exactly one POST sent; attempt resolved as not created |
+| Branching enabled | No branch lookup and no `X-NetBox-Branch` header on broker calls |
 | Deleted or disabled token, including expired | Persistent lock, no replacement |
 | Enabled expired token | Controlled replacement on a later request |
 | Ordinary permission 403 | Original error, no identity lock |
@@ -279,6 +342,29 @@ Required regression scenarios:
 | Duplicate release or canceled release | No negative count or leaked ownership |
 | Old authenticated token, client opens after rotation | Select current generation safely |
 
+### Task 9a: server lifespan and background work
+
+Files: `src/netbox_mcp/server.py`, `src/netbox_mcp/oidc/lifecycle.py`,
+`tests/oidc/test_lifecycle.py`.
+
+- [ ] Keep module import free of store side effects: building the verifier at
+  import time must not open the store, take the lock or start tasks.
+- [ ] Pass a `lifespan` to `FastMCP(...)` that, on entry, opens the store, takes
+  exclusive ownership, runs startup recovery and reconciliation, attaches the
+  broker to the verifier and starts the 60-second reconciliation and daily
+  cleanup loops (design section 8, "Server lifecycle").
+- [ ] Until the broker is attached, OIDC requests receive 503 with `Retry-After`.
+- [ ] On exit, stop new OIDC authentications, cancel and await the loops,
+  release outstanding leases within a bounded timeout (audited), then close the
+  store and release ownership. Background-loop errors are logged visibly and do
+  not stop later scheduled attempts.
+- [ ] Verify the lifespan also runs under `fastmcp run` with `fastmcp.json`, not
+  only through `main()`.
+- [ ] Tests: importing `netbox_mcp.server` does not take the store lock; a second
+  lifespan against the same store fails; shutdown while a lease is held waits and
+  then releases; a failing loop iteration is followed by the next one; no-OIDC
+  configuration starts no broker and no loops.
+
 ### Task 9: integrate HTTP authentication and actual client lifetimes
 
 Files: `src/netbox_mcp/oidc/composite.py`, `src/netbox_mcp/oidc/leases.py`,
@@ -287,12 +373,20 @@ Files: `src/netbox_mcp/oidc/composite.py`, `src/netbox_mcp/oidc/leases.py`,
 
 - [ ] Build the composite verifier and metadata/challenge responses. Reject bad
   JWTs without passthrough fallback. Preserve NetBox passthrough and its 503 errors.
+  With `OIDC_ACCEPT_NETBOX_TOKENS=false`, reject non-JWT bearer values with 401.
+- [ ] Install the error handler on the outermost provider's
+  `AuthenticationMiddleware` and map the typed errors from Task 6 to 401, 403
+  (including `error="insufficient_scope"` in `WWW-Authenticate`) and 503.
+  Confirm against the locked FastMCP version which provider's `get_middleware()`
+  is used when providers are composed.
 - [ ] Use one canonical MCP URL for the metadata resource, configured audience
   and middleware resource. Advertise the design's complete login/refresh scope
   set in initial challenges and resource metadata; enforce the API scope in JWTs.
-- [ ] Populate the verified access token with a personal token, stable NetBox
-  user client ID and a server-owned OIDC-mode marker. Include any resource field
-  required by the selected auth middleware without breaking passthrough.
+- [ ] Populate the verified access token as specified in design section 4:
+  personal token, stable NetBox user client ID, `expires_at = exp + leeway` and
+  the server-owned `netbox_mcp_auth_mode` marker in `claims`, built from verified
+  values only. Include any resource field required by the selected auth
+  middleware without breaking passthrough.
 - [ ] Add an outer ASGI authentication-lease context with cleanup on every exit.
   Treat it as authentication ownership only, not ownership of the SDK tool task.
 - [ ] In every OIDC `NetBoxClient.__aenter__`, acquire a separate lease for the
@@ -304,17 +398,24 @@ Files: `src/netbox_mcp/oidc/composite.py`, `src/netbox_mcp/oidc/leases.py`,
   actually sent. Return useful MCP tool errors without replaying writes.
 - [ ] Return HTTP 403 for locked/denied broker identities and 503 with retry
   guidance for dependency/JWKS failures. JWKS failures must not call the broker.
-- [ ] Run startup recovery, reconciliation every 60 seconds and daily cleanup.
-  Handle background-loop errors visibly and continue later scheduled attempts.
-  Stop/await background work before closing the store and releasing its lock.
-- [ ] Add generic README configuration, privilege/trust-boundary and recovery
-  documentation; no concrete deployment inventory belongs in the package.
+- [ ] Wire the broker from the Task 9a lifespan into the composite verifier and
+  the `NetBoxClient` lease path; do not start background work here.
+- [ ] Add generic README configuration, privilege/trust-boundary, recovery and
+  persistent-volume (runtime UID 10001) documentation, and document NetBox-token
+  passthrough as an explicit exception to the MCP no-passthrough rule. No
+  concrete deployment inventory belongs in the package.
 
 Integration tests must use the fully wired ASGI application and actual SDK
 dispatch, with mocked NetBox/JWKS only:
 
-- [ ] Both metadata routes, 401 challenge, invalid JWT, missing required group,
-  no-OIDC compatibility and passthrough outage/permission behavior.
+- [ ] Both metadata routes, 401 challenge, invalid JWT, missing required group
+  (403), missing required scope (403 with `insufficient_scope`), ID token (401),
+  no-OIDC compatibility and passthrough outage/permission behavior, including
+  the passthrough 503 after composition.
+- [ ] Token expiry within and beyond the 60-second leeway through the real SDK
+  bearer middleware, with an injected clock.
+- [ ] A JWT carrying `netbox_mcp_auth_mode` in its claims does not change the
+  server-set marker.
 - [ ] Accept the correct resource and authorized party. Reject wrong resource,
   client-ID-only audience and wrong `azp` with HTTP 401 and metadata challenge;
   no personal-token issuance on rejection.
@@ -369,8 +470,10 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 
 - [ ] Apply the measured provider settings: dedicated client, strict callbacks,
   stable subject, signing key, lifetimes, group binding and mapped claims.
-- [ ] Apply the proven resource binding, PKCE S256, grant restrictions and
-  token-endpoint auth methods. Register the four measured callbacks, including
+- [ ] Apply the proven resource binding, PKCE S256 (including the enforcing
+  expression policy), grant restrictions and token-endpoint auth methods.
+- [ ] Apply and verify the username namespace precondition: no self-service
+  username change and no user-chosen names in enrollment. Register the four measured callbacks, including
   the CLI port/path details; verify supported response-issuer behavior.
 - [ ] Verify discovery, exact issuer, JWKS and required scopes, including
   advertised `offline_access` and actual refresh-token issuance.
@@ -383,8 +486,9 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 ### Task 13: deploy the workload
 
 - [ ] Snapshot the current workload configuration without disclosing secrets.
-- [ ] Configure a persistent store volume with permissions for the image's
-  runtime UID, inject OIDC configuration and secrets, and use the tested digest.
+- [ ] Configure a persistent store volume writable by the image's runtime UID
+  (10001; the image declares no volume), set `TOKEN_STORE_PATH` inside it, inject
+  OIDC configuration and secrets, and use the tested digest.
 - [ ] Create the encryption key only for a genuinely new store. Preserve it on
   every redeploy and back it up separately through the secret-management process.
 - [ ] Enforce one worker/replica and exclusive store ownership. A replacement
