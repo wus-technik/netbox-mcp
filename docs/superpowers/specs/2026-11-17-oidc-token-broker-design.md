@@ -1,15 +1,61 @@
 # OIDC authentication with personal NetBox tokens
 
 Status: proposed design; implementation and integration tests are outstanding.
+**Blocked** until an Authentik release provides the features listed under
+"Provider prerequisite" below.
 
 Implementation plan: [OIDC token broker implementation](../plans/2026-11-17-oidc-token-broker.md).
 Code baseline: upstream `v0.3.0`. The repository lockfile selects FastMCP 4.1.6
 and MCP Python SDK 2.3.0. NetBox 4.7.3 and Authentik 2026.8.5 are reference
 versions for the API contracts below, not an inventory of any deployment.
+Authentik 2026.8.5 does **not** meet the provider prerequisite. It is the
+version the current behaviour was analysed on, not a supported target.
 
 All service URLs, account names, group names and deployment paths in examples
 are placeholders. No particular organization, infrastructure platform or
 existing permission configuration is assumed.
+
+## Provider prerequisite: a released Authentik version
+
+**Every implementation step of this design requires a released Authentik
+version that natively provides both of the following features.** This applies
+to the Phase A experiments, the package implementation (Phase B) and every
+deployment (Phase C):
+
+1. **Resource indicators (RFC 8707):** the provider accepts `resource` on the
+   authorization and token requests, restricts it to configured allowed
+   resources, issues the access token with `aud` set to the MCP resource URI, and
+   preserves (or only narrows) it on refresh. Upstream:
+   [issue #27645](https://github.com/goauthentik/authentik/issues/27645),
+   [PR #27855](https://github.com/goauthentik/authentik/pull/27855).
+2. **Required PKCE with S256 only:** a provider setting that rejects
+   authorization requests without a code challenge, for confidential clients as
+   well, and disallows `plain`. Upstream:
+   [issue #25520](https://github.com/goauthentik/authentik/issues/25520),
+   [PR #27884](https://github.com/goauthentik/authentik/pull/27884).
+
+Rules:
+
+- **Only a published release counts:** a tagged version with release notes. A
+  merged pull request, the `main` branch, a release candidate, a beta or a
+  nightly image does not satisfy the prerequisite, and neither does a planned
+  milestone (both items are milestoned for 2027.2.0 as of 2026-11-17, unmerged).
+- **Check before starting work:** before any implementation work begins, check
+  that the release contains each feature. Read its release notes and the provider
+  settings in its documentation, and confirm the merged pull requests are in
+  that release's tag. Record the version and the evidence in the plan.
+- **Test the release itself:** Phase A tests must then show that the release
+  behaves as required. The release notes alone are not proof.
+- **Minimum version:** that release becomes the minimum supported provider
+  version. Replace the Authentik reference version in this document and in the
+  source links of section 10 with it.
+- **Every deployment:** check that the production provider runs at least the
+  minimum version before deploying, and again before each provider upgrade or
+  downgrade.
+- **No workarounds:** the following do not replace the native features: token
+  exchange, `aud` from a scope mapping, expression policies, a proxy or a patched
+  provider build. If a release ships only one of the two features, the
+  prerequisite is not met.
 
 ## 1. Purpose and boundaries
 
@@ -100,20 +146,17 @@ silently broaden the verifier to accept arbitrary clients.
 
 Require authorization-code flow with **PKCE S256**, including for confidential
 clients. Discovery must advertise `code_challenge_methods_supported` **including**
-`S256`, and the supported `token_endpoint_auth_methods_supported`. Advertising
-`plain` alongside is tolerated only if the negative probes below prove that the
-provider rejects it. Enforcement is proven by those probes, not by discovery.
+`S256`, and the supported `token_endpoint_auth_methods_supported`. With `plain`
+disallowed in the native provider setting, discovery is expected to list only
+`S256`; record what the minimum release actually advertises. Enforcement is
+proven by the negative probes below, not by discovery.
 
-The reference Authentik version advertises `plain` and `S256`, accepts an
-authorization request without a challenge, and checks the verifier only when a
-challenge was recorded (per review of its source; confirm in Phase A). Provider
-configuration alone therefore does not enforce S256. For Authentik, bind an
-expression policy to the application's authorization flow that denies requests
-without a nonempty `code_challenge` or with a `code_challenge_method` other than
-`S256`. Phase A must prove that such a policy can read the authorization request
-parameters; if it cannot, S256 enforcement fails the gate until the provider
-supports it natively (see "Upstream status" below). Other providers need an
-equivalent, tested enforcement. Record and test the
+Authentik releases up to and including 2026.8.5 advertise `plain` and `S256`,
+accept an authorization request without a challenge, and check the verifier
+only when a challenge was recorded. They cannot meet this requirement. Use the
+native PKCE setting of the minimum provider release (see "Provider
+prerequisite"), set to require PKCE for all clients with `plain` disallowed. An
+expression policy is not an accepted substitute. Record and test the
 actual method selected by each client (for example `client_secret_basic` or
 `client_secret_post`), both at code exchange and refresh. Reject authorization
 without an S256 challenge, an absent or incorrect PKCE verifier, and a code
@@ -181,24 +224,31 @@ and the appended OIDC form last. Phase A must record, per client, which URL it
 fetched, that it accepted the metadata, and that the returned `issuer` matched
 the configured issuer exactly, including the trailing slash.
 
-**Provider gate:** do not assume the reference Authentik version can implement
-this resource contract. Prove it with real authorization, exchange and refresh
-requests before implementing the broker. If it cannot, stop Phase A and revise
-the provider integration or architecture. An OAuth proxy remains outside the
-initial scope; introducing one requires a revised design. A successful login
-with a client-ID-only audience does not pass this gate.
+**Provider gate:** the gate has two stages, and both must pass before the
+broker is implemented.
 
-This gate is expected to fail for the reference provider (see "Upstream status"
-below). Decide in advance which fallback to evaluate if it fails, so that the
-gate leads to a quick decision instead of an open-ended investigation:
+1. **Release check.** Confirm the "Provider prerequisite" (top of this document)
+   against a published Authentik release.
+2. **Behaviour check.** Prove the resource contract and PKCE enforcement with
+   real authorization, code-exchange and refresh requests against that release.
 
-1. Wait for native provider support. For Authentik, both RFC 8707 resource
-   binding and PKCE enforcement are targeted at release 2027.2.0, but not merged.
-2. A different identity provider that issues resource-bound access tokens and
-   enforces PKCE S256.
-3. A revised design with a narrowly scoped OAuth proxy (out of scope here).
+A successful login with a client-ID-only audience does not pass this gate.
 
-Not acceptable as fallbacks:
+**Decision (2026-11-17): wait for native support in a released Authentik
+version.** Released Authentik versions up to 2026.8.5 fail the gate, and both
+features are targeted at 2027.2.0 but not merged (see "Upstream status" below).
+No phase of this plan starts before such a release exists and has passed both
+stages.
+
+The following are explicitly not pursued while waiting:
+
+- Switching to a different identity provider.
+- Adding an OAuth proxy.
+- Building a patched Authentik.
+
+Changing that requires a new decision and a revised design.
+
+Also not acceptable as workarounds:
 
 - **Authentik token exchange (RFC 8693, since 2026.8.0).** Its `audience`
   parameter accepts only a target provider's client ID or application UUID, so
@@ -208,11 +258,16 @@ Not acceptable as fallbacks:
   the mapping also overwrites the ID token's `aud` (confirmed upstream bug). The
   documented workaround `["<resource>", client_id]` puts the resource into the ID
   token's audience as well, which removes the separation this design relies on.
+- **An expression policy enforcing PKCE.** It would emulate the missing provider
+  setting without the token-endpoint enforcement and discovery change of the
+  native feature.
 
 ### Upstream status (Authentik, checked 2026-11-17)
 
 Latest release at the time of checking: 2026.8.5; 2026.11.0 is not yet tagged
-and contains none of the items below. Recheck before Phase A.
+and contains none of the items below. This table is a snapshot. It does not
+prove anything about a release: the release check in the provider gate decides.
+Recheck it whenever a new Authentik release appears.
 
 | Topic | Upstream item | Status |
 | --- | --- | --- |
@@ -223,10 +278,11 @@ and contains none of the items below. Recheck before Phase A.
 | Scope-mapping `aud` overwrites ID-token `aud` | [Issue #25235](https://github.com/goauthentik/authentik/issues/25235) | Open, confirmed bug, milestone 2027.2.0. |
 | Audience for resource-server protection | [Issue #14545](https://github.com/goauthentik/authentik/issues/14545) | Closed 2026-11-04 in favour of #22070; maintainers point to token exchange in the meantime. |
 
-Consequences for this design: with released Authentik versions the provider
-gate fails on resource binding and, unless the expression policy works, on PKCE
-enforcement. Of today's Authentik tokens, only the access token carries a `scope`
-claim, which matches rule 2 of the ID-token criterion in section 4.
+Consequences for this design: no released Authentik version meets the
+provider prerequisite yet, so implementation is blocked. Of today's Authentik
+tokens, only the access token carries a `scope` claim, which matches rule 2 of
+the ID-token criterion in section 4. Recheck this against the minimum release,
+because RFC 8707 support changes the access token's `aud`.
 
 Measure removal from the application binding, removal from the required group,
 and account deactivation separately. Acceptance requires denial of newly issued

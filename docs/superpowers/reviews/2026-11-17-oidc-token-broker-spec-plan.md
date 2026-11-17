@@ -60,3 +60,19 @@ Status: alle Befunde am selben Tag in Spec und Plan eingearbeitet (siehe „Maß
 | 15 | Plan Task 5: `tests/oidc/__init__.py`, Testdatei umbenannt in `test_oidc_config.py`. |
 | 16 | Spec §3: Fallbacks festgelegt, Upstream-Stand bei Authentik dokumentiert (RFC 8707 und PKCE-Pflicht erst für 2027.2.0 geplant, nicht gemergt). Token Exchange und `aud` per Scope-Mapping ausdrücklich ausgeschlossen. Plan Task 4. |
 | 17 | Spec §6: einfacheren Lebenszyklus als Alternative beschrieben, Entscheidung am Gate in Task 4. |
+
+## Nachtrag: Entscheidung zum Provider-Gate (2026-11-17)
+
+Entscheidung: auf native Unterstützung in einem **veröffentlichten** Authentik-Release warten.
+Das ersetzt die Maßnahmen zu Befund 2 (Expression Policy) und 16 (Fallback-Reihenfolge).
+
+- Spec, neuer Abschnitt „Provider prerequisite“: Jede Umsetzung setzt ein Authentik-Release voraus,
+  das RFC 8707 (Issue #27645 / PR #27855) und verpflichtendes PKCE nur mit S256
+  (Issue #25520 / PR #27884) nativ enthält. Merge, `main`, RC, Beta, Nightly und Milestone zählen nicht.
+  Für jedes Feature ist nachzuweisen, dass es im Release enthalten ist: Release Notes, Doku,
+  Merge-Commit im Release-Tag. Das Release wird zur Mindestversion.
+- Ausgeschlossen: Token Exchange, `aud` per Scope-Mapping, Expression Policy, Proxy,
+  gepatchter Build sowie ein Wechsel des IdP ohne neue Entscheidung.
+- Plan: neuer Task 0 (Release-Prüfung mit Ergebnistabelle) blockiert alle Phasen.
+  In Tasks 1, 12 und 13 wird die Provider-Version geprüft. Task 4 stoppt, wenn das Verhalten
+  nicht passt.

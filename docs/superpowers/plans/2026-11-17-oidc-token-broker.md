@@ -1,6 +1,9 @@
 # OIDC token broker implementation plan
 
-Status: proposed work, not an implemented or verified feature.
+Status: proposed work, not an implemented or verified feature. **Blocked** until
+Task 0 passes: every task below requires a released Authentik version that
+provides RFC 8707 resource indicators and required PKCE S256 natively (design,
+"Provider prerequisite").
 
 Design: [OIDC authentication with personal NetBox tokens](../specs/2026-11-17-oidc-token-broker-design.md).
 Start implementation from upstream `v0.3.0`. Reference API versions and all
@@ -31,10 +34,56 @@ actual client versions/hosted test dates privately.
 - Commit coherent steps with conventional messages. Verify publication content
   and reachable commit history before pushing a public branch or tag.
 
+## Phase 0: provider release prerequisite
+
+### Task 0: verify the Authentik release
+
+No task of Phase A, B, C or D may start before this task is complete. This
+includes experiments, prototypes, implementation branches, image builds and
+provider configuration.
+
+- [ ] Identify the first **published** Authentik release (tagged, with release
+  notes) that contains both:
+  - RFC 8707 resource indicators with `aud` set to the resource, from
+    issue #27645 / PR #27855;
+  - required PKCE with `plain` disallowed, from issue #25520 / PR #27884.
+
+  A merged PR, `main`, a release candidate, a beta, a nightly image or a
+  milestone does not count.
+- [ ] For each feature, verify presence in that release:
+  - the release notes entry;
+  - the provider settings in that version's documentation;
+  - the merged PR commit being contained in the release tag
+    (`gh api repos/goauthentik/authentik/compare/<merge-commit>...version/<release> --jq .status`
+    returns `ahead` or `identical`).
+
+  Record links and results here, without deployment data.
+- [ ] If either feature is missing, stop. Recheck at the next Authentik
+  release. Do not substitute token exchange, scope-mapping `aud`, expression
+  policies, a proxy or a patched build.
+- [ ] Record the release as the **minimum provider version**. Update the design:
+  the reference version, the "Upstream status" table and the source links in
+  section 10.
+- [ ] Recheck the ID-token criterion and the claims the design expects (design
+  section 4) against the minimum release's documentation before Phase A.
+
+Result record:
+
+| Feature | Release | Release notes | Docs | Commit in tag | Checked on |
+| --- | --- | --- | --- | --- | --- |
+| RFC 8707 resource indicators | Pending | Pending | Pending | Pending | Pending |
+| Required PKCE, S256 only | Pending | Pending | Pending | Pending | Pending |
+
 ## Phase A: prove client/provider compatibility
+
+All Phase A experiments run against the minimum provider version from Task 0 or
+a later release, never against an older version, a pre-release or a patched
+build.
 
 ### Task 1: isolated discovery and identity probe
 
+- [ ] Confirm the test provider instance reports the Task 0 minimum version or
+  later, and record the version.
 - [ ] Provision a temporary provider/application and dedicated test group with
   two disposable users. Do not reuse a production application for experiments.
 - [ ] Create a minimal FastMCP server with remote authentication and a `whoami`
@@ -45,10 +94,11 @@ actual client versions/hosted test dates privately.
   unused grants and advertise the actual token-endpoint auth methods. Verify
   discovery includes `code_challenge_methods_supported` with `S256` and all
   requested scopes, including `offline_access`.
-- [ ] Enforce S256 with the expression policy described in design section 3
-  (deny a missing or empty `code_challenge` and any method other than `S256`).
-  Configuration alone does not enforce it on the reference provider; the Task 2
-  negative probes are the evidence.
+- [ ] Enforce S256 with the provider's native PKCE setting: required for all
+  clients, `plain` disallowed. The Task 2 negative probes are the evidence. Do
+  not use an expression policy.
+- [ ] Configure the MCP resource URI as the provider's allowed resource for
+  RFC 8707.
 - [ ] Verify the username namespace precondition (design section 3): users cannot
   change their own username claim, and no enrollment flow lets them pick one.
   Record the provider settings that guarantee this.
@@ -144,13 +194,13 @@ provider tests supplement, rather than replace, the per-client flow checks.
   If the provider cannot issue resource-bound access tokens, stop and revise
   the integration or architecture before package implementation. Do not accept
   client-ID-only audiences as a compatibility exception or add a proxy silently.
-- [ ] Before Phase A, recheck the upstream items in design section 3 ("Upstream
-  status"). If a provider release with RFC 8707 and PKCE enforcement is
-  available, use it for the experiment.
-- [ ] If the resource-binding gate fails, evaluate the fallbacks named in design
-  section 3 in their stated order (wait for native support, other provider,
-  revised design with a proxy) and record the decision before any further work.
-  Token exchange and scope-mapping `aud` overrides are not acceptable fallbacks.
+- [ ] Confirm Task 0 is complete and Phase A ran against the recorded minimum
+  provider version or later.
+- [ ] If the release fails the behaviour check despite its release notes, stop.
+  Report the deviation upstream if appropriate, and wait for a release that
+  passes. The decision in design section 3 is to wait for native support. A
+  different provider, a proxy or a workaround requires a new decision and a
+  revised design.
 - [ ] Decide whether to keep the full lease/generation lifecycle or the simpler
   lifecycle described in design section 6, and record the decision.
 - [ ] If provider behavior changes the design, update this design and plan before
@@ -470,8 +520,11 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 
 - [ ] Apply the measured provider settings: dedicated client, strict callbacks,
   stable subject, signing key, lifetimes, group binding and mapped claims.
-- [ ] Apply the proven resource binding, PKCE S256 (including the enforcing
-  expression policy), grant restrictions and token-endpoint auth methods.
+- [ ] Before any change, verify the permanent provider runs the Task 0 minimum
+  version or later. If it does not, upgrade the provider first as a separate
+  change; do not configure the application on an older version.
+- [ ] Apply the proven resource binding, native PKCE S256 enforcement, grant
+  restrictions and token-endpoint auth methods.
 - [ ] Apply and verify the username namespace precondition: no self-service
   username change and no user-chosen names in enrollment. Register the four measured callbacks, including
   the CLI port/path details; verify supported response-issuer behavior.
@@ -485,6 +538,7 @@ Run the existing suite and applicable repository checks: `uv run pytest`,
 
 ### Task 13: deploy the workload
 
+- [ ] Re-verify that the provider still runs the minimum version or later.
 - [ ] Snapshot the current workload configuration without disclosing secrets.
 - [ ] Configure a persistent store volume writable by the image's runtime UID
   (10001; the image declares no volume), set `TOKEN_STORE_PATH` inside it, inject
