@@ -66,7 +66,8 @@ class NetBoxUser:
     id: int
     username: str
     is_active: bool
-    is_superuser: bool
+    # None when NetBox's REST API does not expose the flag (unknown).
+    is_superuser: bool | None
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,7 @@ def _user(row: Any) -> NetBoxUser:
         id=row["id"],
         username=str(row.get("username", "")),
         is_active=bool(row.get("is_active")),
-        is_superuser=bool(row.get("is_superuser")),
+        is_superuser=bool(row["is_superuser"]) if "is_superuser" in row else None,
     )
 
 
@@ -163,9 +164,10 @@ class NetBoxBroker:
         except NetBoxAPIError as exc:
             if exc.status == 404:
                 raise
+            # No cause: it would carry NetBox's response body.
             raise BrokerUnavailable(
                 f"NetBox answered {method} {path} with HTTP {exc.status}"
-            ) from exc
+            ) from None
         except (
             AmbiguousWriteError,
             MissingTokenError,
@@ -193,8 +195,12 @@ class NetBoxBroker:
                 raise BrokerUnavailable(f"NetBox answered GET {path} with a bad page")
             batch = page["results"]
             rows.extend(batch)
-            if not page.get("next") or not batch:
+            if not page.get("next"):
                 return rows
+            if not batch:
+                raise BrokerUnavailable(
+                    f"NetBox answered GET {path} with an empty page"
+                )
             # Advance by rows received: NetBox may clamp the page size.
             offset += len(batch)
 
@@ -206,7 +212,11 @@ class NetBoxBroker:
         Raises:
             BrokerConflict: If more than one user matches.
         """
-        rows = await self._results(USERS_PATH, {"username": username})
+        rows = [
+            row
+            for row in await self._results(USERS_PATH, {"username": username})
+            if isinstance(row, dict) and row.get("username") == username
+        ]
         if len(rows) > 1:
             raise BrokerConflict(f"More than one NetBox user matches {username!r}")
         return _user(rows[0]) if rows else None
@@ -237,9 +247,23 @@ class NetBoxBroker:
         }
         try:
             async with self._client() as nb:
+                http = nb._http
+                if http is None:
+                    raise BrokerAmbiguous("The broker client was not opened")
+                # A 307/308 would make httpx send the token POST a second time.
+                http.follow_redirects = False
+                seen: list[int] = []
+
+                async def tap(response: httpx2.Response) -> None:
+                    seen.append(response.status_code)
+
+                http.event_hooks["response"].append(tap)
                 body = await nb.request(
                     "POST", TOKENS_PATH, json=payload, use_branch=False
                 )
+            if any(300 <= code < 400 for code in seen):
+                # NetBox redirected before the view ran: no token was created.
+                raise BrokerDefinite("The token create was redirected, not applied")
         except NetBoxAPIError as exc:
             if 400 <= exc.status < 500:
                 raise BrokerDefinite(

@@ -33,10 +33,14 @@ async def test_find_user_unique_inactive_superuser_fields(
     assert alice is not None
     assert (alice.id, alice.username) == (1, "alice")
     assert alice.is_active
-    assert not alice.is_superuser
+    assert alice.is_superuser is None  # real NetBox rows omit the flag
+    fake_netbox_tokens.expose_is_superuser = True
+    alice = await broker.find_user("alice")
+    assert alice is not None
+    assert alice.is_superuser is False
     admin = await broker.find_user("admin")
     assert admin is not None
-    assert admin.is_superuser
+    assert admin.is_superuser is True
     dave = await broker.find_user("dave")
     assert dave is not None
     assert not dave.is_active
@@ -203,3 +207,57 @@ async def test_delete_404_counts_as_deleted(
     fake_netbox_tokens.fail("tokens.delete", 500)
     with pytest.raises(BrokerUnavailable):
         await broker.delete_token(1)
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_create_token_redirect_never_resends_post(status: int) -> None:
+    posts: list[str] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.method == "POST":
+            posts.append(str(request.url))
+        return httpx2.Response(status, headers={"Location": "/api/users/tokens/"})
+
+    config = NetBoxConfig(netbox_url="https://netbox.example.com")
+    broker = NetBoxBroker(config, SERVICE, transport=httpx2.MockTransport(handler))
+    with pytest.raises(BrokerDefinite):
+        await broker.create_token(1, "d", time.time() + 100)
+    assert len(posts) == 1
+
+
+async def test_error_cause_does_not_carry_response_body(
+    broker: NetBoxBroker, fake_netbox_tokens: FakeNetBoxTokens
+) -> None:
+    fake_netbox_tokens.fail("users.list", 500)
+    with pytest.raises(BrokerUnavailable) as info:
+        await broker.find_user("alice")
+    assert info.value.__cause__ is None
+    assert info.value.__suppress_context__
+
+
+async def test_empty_page_with_next_is_unavailable() -> None:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200, json={"count": 9, "next": "https://x/?offset=2", "results": []}
+        )
+
+    config = NetBoxConfig(netbox_url="https://netbox.example.com")
+    broker = NetBoxBroker(config, SERVICE, transport=httpx2.MockTransport(handler))
+    with pytest.raises(BrokerUnavailable):
+        await broker.list_tokens(1, "x")
+
+
+async def test_find_user_ignores_inexact_username_rows() -> None:
+    def row(pk: int, name: str) -> dict:
+        return {"id": pk, "username": name, "is_active": True}
+
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        results = [row(1, "Alice"), row(2, "alice"), row(3, "alice2")]
+        return httpx2.Response(200, json={"next": None, "results": results})
+
+    config = NetBoxConfig(netbox_url="https://netbox.example.com")
+    broker = NetBoxBroker(config, SERVICE, transport=httpx2.MockTransport(handler))
+    user = await broker.find_user("alice")
+    assert user is not None
+    assert user.id == 2
+    assert await broker.find_user("bob") is None

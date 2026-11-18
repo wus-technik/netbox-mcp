@@ -425,6 +425,8 @@ class FakeNetBoxTokens:
         # Canned paths outside users/tokens that answer 200; everything else 404s.
         self.other_paths = {"/api/status/", "/api/dcim/sites/", "/api/dcim/devices/"}
         self.invalid_token_status = 403
+        # Real NetBox user rows omit is_superuser; set True to include it.
+        self.expose_is_superuser = False
         self.users: dict[int, _User] = {}
         self.tokens: dict[int, dict[str, Any]] = {}
         self._next_token_id = 1
@@ -692,14 +694,16 @@ class FakeNetBoxTokens:
         )
 
     def _user_json(self, user: _User) -> dict[str, Any]:
-        return {
+        row = {
             "id": user.id,
             "username": user.username,
             "is_active": user.is_active,
-            "is_superuser": user.is_superuser,
             "groups": [{"name": g} for g in user.groups],
             "display": user.username,
         }
+        if self.expose_is_superuser:
+            row["is_superuser"] = user.is_superuser
+        return row
 
     def _token_json(self, token: dict[str, Any]) -> dict[str, Any]:
         user = self.users[token["user"]]
