@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import sys
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -109,6 +110,33 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+# Windows only: a scanner/indexer can briefly hold the file, making the rename
+# fail with PermissionError (WinError 5/32). Backoff before each retry; total < 0.2 s.
+_REPLACE_RETRY_DELAYS = (0.01, 0.02, 0.04, 0.05)
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32"
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """``os.replace``; on Windows retry bounded on transient sharing errors.
+
+    Only a failed replace is retried; once it succeeded nothing is repeated. If
+    all attempts fail the last ``PermissionError`` propagates with ``dst`` intact.
+    """
+    delays = iter(_REPLACE_RETRY_DELAYS if _is_windows() else ())
+    while True:
+        try:
+            src.replace(dst)
+            return
+        except PermissionError:
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+
 def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
     """Publish ``data`` at ``path``: temp file in the same dir, fsync, rename.
 
@@ -123,7 +151,7 @@ def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
             f.flush()
             os.fsync(f.fileno())
         if overwrite:
-            tmp.replace(path)
+            _replace_with_retry(tmp, path)
         else:
             os.link(tmp, path)
             # Published; a leftover temp file must not turn this into a failure.

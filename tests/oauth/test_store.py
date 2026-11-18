@@ -502,3 +502,87 @@ def test_open_removes_stale_tmp_files(tmp_path: Path) -> None:
         "state.bin.abc123.tmp",
         "state.bin.backup.tmp",
     ]
+
+
+@pytest.mark.asyncio
+async def test_replace_retries_transient_permission_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    s = StateStore.open(path, KEY)
+    try:
+        real_replace = os.replace
+        calls: list[int] = []
+
+        def flaky(src: object, dst: object) -> None:
+            calls.append(1)
+            if len(calls) <= 2:
+                raise PermissionError(errno.EACCES, "sharing violation")
+            real_replace(src, dst)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(store_module, "_is_windows", lambda: True)
+        monkeypatch.setattr(store_module.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(os, "replace", flaky)
+        async with s.mutate() as state:
+            state.clients["c1"] = _client("c1")
+        assert len(calls) == 3
+        assert set(s.snapshot().clients) == {"c1"}
+        assert not list(tmp_path.glob("*.tmp"))
+    finally:
+        s.close()
+    reopened = StateStore.open(path, KEY)
+    try:
+        assert set(reopened.snapshot().clients) == {"c1"}
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_replace_persistent_permission_error_keeps_old_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    s = StateStore.open(path, KEY)
+    try:
+        on_disk = path.read_bytes()
+        calls: list[int] = []
+
+        def locked(*_a: object, **_k: object) -> None:
+            calls.append(1)
+            raise PermissionError(errno.EACCES, "sharing violation")
+
+        monkeypatch.setattr(store_module, "_is_windows", lambda: True)
+        monkeypatch.setattr(store_module.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(os, "replace", locked)
+        with pytest.raises(StoreWriteError) as exc:
+            async with s.mutate() as state:
+                state.clients["c1"] = _client("c1")
+        assert "not confirmed" not in str(exc.value)
+        assert len(calls) == len(store_module._REPLACE_RETRY_DELAYS) + 1
+        assert path.read_bytes() == on_disk
+        assert not list(tmp_path.glob("*.tmp"))
+        monkeypatch.undo()
+        # not marked failed: the next write works
+        async with s.mutate() as state:
+            state.clients["c2"] = _client("c2")
+        assert set(s.snapshot().clients) == {"c2"}
+    finally:
+        s.close()
+
+
+def test_replace_not_retried_off_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+
+    def locked(*_a: object, **_k: object) -> None:
+        calls.append(1)
+        raise PermissionError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(store_module, "_is_windows", lambda: False)
+    monkeypatch.setattr(os, "replace", locked)
+    with pytest.raises(PermissionError):
+        store_module._replace_with_retry(tmp_path / "a", tmp_path / "b")
+    assert len(calls) == 1
