@@ -7,6 +7,8 @@ import pytest
 
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.store import StateStore
+from tests.oauth.fakes import FakeIdP
+from tests.oauth.fakes import FakeNetBoxTokens
 
 OAUTH_ENV = {
     "OIDC_ISSUER": "https://idp.example.com/realm",
@@ -63,3 +65,18 @@ def store(oauth_config: OAuthConfig) -> Iterator[StateStore]:
     opened = StateStore.open(oauth_config.state_path, oauth_config.state_key)
     yield opened
     opened.close()
+
+
+@pytest.fixture
+def fake_idp() -> FakeIdP:
+    """In-process OIDC provider matching ``oauth_config`` (client ID and secret)."""
+    return FakeIdP(
+        client_id=OAUTH_ENV["OIDC_CLIENT_ID"],
+        client_secret=OAUTH_ENV["OIDC_CLIENT_SECRET"],
+    )
+
+
+@pytest.fixture
+def fake_netbox_tokens() -> FakeNetBoxTokens:
+    """Stateful NetBox users/tokens API; its service token is the broker token."""
+    return FakeNetBoxTokens(service_token=OAUTH_ENV["NETBOX_TOKEN_BROKER_TOKEN"])
