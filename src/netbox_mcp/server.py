@@ -11,6 +11,7 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from urllib.parse import urlparse
 
+import uvicorn
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp import settings
@@ -25,6 +26,9 @@ from netbox_mcp.auth import build_auth_provider
 from netbox_mcp.auth import rate_limit_client_id
 from netbox_mcp.netbox_client import get_netbox_config_from_env
 from netbox_mcp.netbox_client import get_transport_config_from_env
+from netbox_mcp.oauth.app import build_oauth_app
+from netbox_mcp.oauth.app import oauth_launch_guard
+from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.config import get_oauth_config_from_env
 from netbox_mcp.sentry_init import init_sentry
 from netbox_mcp.tools import register_tools
@@ -76,6 +80,12 @@ except Exception as e:
     logger.error(f"Invalid configuration: {e}")
     raise
 
+# OAuth mode calls NetBox only with each session's own token: the server's
+# NETBOX_TOKEN is dropped, so no code path can fall back to it.
+NETBOX_TOKEN_IGNORED = OAUTH_CONFIG is not None and bool(NETBOX_CONFIG.token)
+if OAUTH_CONFIG is not None:
+    NETBOX_CONFIG = NETBOX_CONFIG.model_copy(update={"token": None})
+
 
 def build_instructions() -> str:
     """Describe the server to the model, including the active safety modes."""
@@ -103,12 +113,14 @@ def build_instructions() -> str:
     return " ".join(parts)
 
 
-# Initialize FastMCP server
+# Initialize FastMCP server. In OAuth mode its lifespan refuses to start
+# unless main()'s outer app starts it, which turns away `fastmcp run`.
 mcp = FastMCP(
     name="NetBox MCP Server",
     version=__version__,
     instructions=build_instructions(),
     auth=auth_provider,
+    lifespan=oauth_launch_guard if OAUTH_CONFIG is not None else None,
 )
 
 
@@ -189,13 +201,30 @@ if NETBOX_CONFIG.rate_limit_enabled:
     )
 
 
-def main():
-    # Fail closed: OAuth mode has no verifier yet, so starting would serve the
-    # tools unauthenticated.
-    if OAUTH_CONFIG is not None:
-        logger.error("OAuth mode (OIDC_ISSUER) is not implemented yet.")
-        raise SystemExit(1)
+def run_oauth(oauth_config: OAuthConfig) -> None:
+    """Serve OAuth mode: the outer app around FastMCP, via uvicorn."""
+    if NETBOX_TOKEN_IGNORED:
+        logger.warning(
+            "NETBOX_TOKEN is ignored: OAuth mode calls NetBox with each "
+            "session's own token."
+        )
+    logger.info(
+        "Starting NetBox MCP Server in OAuth mode connecting to %s, public URL %s",
+        NETBOX_CONFIG.netbox_url,
+        oauth_config.public_url,
+    )
+    app = build_oauth_app(mcp, oauth_config, netbox_config=NETBOX_CONFIG)
+    # uvicorn's access log would print request lines with `code` and `state`;
+    # the server logs its own events instead (spec 4, 9).
+    uvicorn.run(
+        app,
+        host=TRANSPORT_CONFIG.http_host,
+        port=TRANSPORT_CONFIG.http_port,
+        access_log=False,
+    )
 
+
+def main():
     # A typo must not fall back to stdio: the HTTP port would never open while
     # the container healthcheck, which skips non-HTTP transports, kept reporting
     # healthy. Checked here rather than at import, because `fastmcp run` imports
@@ -226,6 +255,10 @@ def main():
             "NETBOX_URL uses plaintext http://. The API token is sent in the "
             "Authorization header on every request - use https:// outside a trusted network."
         )
+
+    if OAUTH_CONFIG is not None:
+        run_oauth(OAUTH_CONFIG)
+        return
 
     if NETBOX_CONFIG.token_passthrough:
         # Each client authenticates with its own NetBox token instead.

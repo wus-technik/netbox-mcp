@@ -13,6 +13,7 @@ import hmac
 import logging
 import uuid
 import weakref
+from typing import Literal
 
 from netbox_mcp.oauth import tokens as token_time
 from netbox_mcp.oauth.broker import BrokerAmbiguous
@@ -35,6 +36,7 @@ from netbox_mcp.oauth.state import PendingCreate
 from netbox_mcp.oauth.state import Replay
 from netbox_mcp.oauth.state import Session
 from netbox_mcp.oauth.store import StateStore
+from netbox_mcp.oauth.store import StoreError
 from netbox_mcp.oauth.store import StoreWriteError
 from netbox_mcp.oauth.tokens import SCOPE
 from netbox_mcp.oauth.tokens import AccessTokens
@@ -365,17 +367,31 @@ class SessionManager:
         async with self.lock_for(sid):
             await self.renew_if_due_locked(sid)
 
-    async def renew_if_due_locked(self, sid: str) -> None:
+    def renewal_due(self, sid: str) -> bool:
+        """True if the session's NetBox token has less than 2 days left.
+
+        A cheap check without the session lock, so a request does not wait on
+        a refresh holding the lock when nothing is due.
+        """
+        session = self.store.snapshot().sessions.get(sid)
+        if session is None or session.netbox_token_expires_at is None:
+            return False
+        return session.netbox_token_expires_at - token_time.now() < RENEW_BELOW
+
+    async def renew_if_due_locked(self, sid: str, *, force: bool = False) -> None:
+        """Body of :meth:`renew_if_due`; ``force`` renews regardless of expiry
+        (NetBox reported the token expired)."""
         snap = self.store.snapshot()
         session = snap.sessions.get(sid)
         if session is None:
             return
-        if session.netbox_token_expires_at is None:
-            logger.warning("oauth: session %s has no token expiry", sid[:8])
-            return
         now = token_time.now()
-        if session.netbox_token_expires_at - now >= RENEW_BELOW:
-            return
+        if not force:
+            if session.netbox_token_expires_at is None:
+                logger.warning("oauth: session %s has no token expiry", sid[:8])
+                return
+            if session.netbox_token_expires_at - now >= RENEW_BELOW:
+                return
         client = snap.clients.get(session.client_id)
         name = client.client_name if client else session.client_id
         nonce = uuid.uuid4().hex
@@ -450,6 +466,60 @@ class SessionManager:
         self._index_drop(*self._session_hashes(ended))
         logger.info("session_ended sid=%s reason=%s", sid[:8], reason)
         self.cleanup_wanted.set()
+
+    # ------------------------------------------------- NetBox rejections
+
+    async def handle_netbox_rejection(
+        self, sid: str, used_version: int
+    ) -> Literal["retry", "ended", "permission", "unavailable"]:
+        """Classify a 401/403 NetBox gave a tool call (spec 6.3).
+
+        ``retry``: the session holds a newer token now; call once more with it.
+        ``ended``: the token is gone or disabled; the session was ended.
+        ``permission``: the token is fine, the 403 is an ordinary refusal.
+        ``unavailable``: NetBox could not confirm either way; nothing changed.
+        """
+        async with self.lock_for(sid):
+            try:
+                session = self.store.snapshot().sessions.get(sid)
+            except StoreError:
+                return "unavailable"
+            if session is None:
+                return "ended"
+            if session.token_version != used_version:
+                # Superseded meanwhile: never end a session over an old token.
+                return "retry"
+            try:
+                info = await self.broker.get_token(session.netbox_token_id)
+            except BrokerError:
+                logger.warning("oauth: NetBox token check unavailable sid=%s", sid[:8])
+                return "unavailable"
+            reason = None
+            if info is None:
+                reason = "netbox_token_missing"
+            elif not info.enabled:
+                reason = "netbox_token_disabled"
+            if reason is not None:
+                try:
+                    await self.end_session_locked(sid, reason)
+                except StoreError:
+                    logger.warning("oauth: could not end session sid=%s", sid[:8])
+                    return "unavailable"
+                return "ended"
+            if info is None or info.expires_at is None:
+                return "permission"
+            if info.expires_at > token_time.now():
+                return "permission"
+            # Expired: renew and retry once. A failed renewal is logged by
+            # renew_if_due_locked and leaves the version unchanged.
+            try:
+                await self.renew_if_due_locked(sid, force=True)
+                current = self.store.snapshot().sessions.get(sid)
+            except StoreError:
+                return "unavailable"
+            if current is not None and current.token_version != used_version:
+                return "retry"
+            return "unavailable"
 
     # -------------------------------------------------------------- hash index
 

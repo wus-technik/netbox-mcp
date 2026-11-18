@@ -28,6 +28,8 @@ from netbox_mcp.netbox_client import NetBoxClient
 from netbox_mcp.netbox_client import bounded_put
 from netbox_mcp.netbox_client import token_fingerprint
 from netbox_mcp.oauth.config import OAuthConfig
+from netbox_mcp.oauth.verifier import OAUTH_AUTH_MODE
+from netbox_mcp.oauth.verifier import OAuthTokenVerifier
 from netbox_mcp.utils import HTTP_TRANSPORTS
 
 logger = logging.getLogger(__name__)
@@ -322,20 +324,17 @@ def rate_limit_client_id(_context: object) -> str:
 
     Keyed by the verified ``client_id``: the NetBox user ID, so one user with
     several tokens still gets a single window, or the token's fingerprint on
-    NetBox before 4.5. Unauthenticated transports such as stdio share one
-    ``"global"`` window, as before.
+    NetBox before 4.5. In OAuth mode the key is the internal user key, so one
+    user with several client registrations shares one window. Unauthenticated
+    transports such as stdio share one ``"global"`` window, as before.
     """
     access_token = get_access_token()
     if access_token is None or not access_token.token:
         return "global"
+    claims = access_token.claims or {}
+    if claims.get("netbox_mcp_auth_mode") == OAUTH_AUTH_MODE:
+        return f"oauth:{claims['sub']}"
     return access_token.client_id
-
-
-class DenyAllTokenVerifier(TokenVerifier):
-    """Rejects every token; keeps OAuth mode closed until its verifier exists."""
-
-    async def verify_token(self, token: str) -> AccessToken | None:  # noqa: ARG002
-        return None
 
 
 def build_auth_provider(
@@ -353,8 +352,8 @@ def build_auth_provider(
     Returns:
         AuthProvider | None: A NetBox token verifier with token passthrough, a
             static bearer token verifier with MCP_HTTP_BEARER_TOKEN, else None.
-            In OAuth mode a verifier that denies every token, until the
-            OAuth verifier exists.
+            In OAuth mode the OAuth verifier, which rejects every token until
+            the outer app binds it to the session manager.
 
     Raises:
         ValueError: If token passthrough is combined with stdio or with
@@ -374,8 +373,9 @@ def build_auth_provider(
             )
         if transport_config.transport_type != "http":
             raise ValueError("OIDC_ISSUER (OAuth mode) requires MCP_TRANSPORT=http")
-        # Fail closed: `fastmcp run` imports server.py without calling main().
-        return DenyAllTokenVerifier()
+        # Unbound until main()'s outer app starts: `fastmcp run` imports
+        # server.py without it and gets a verifier that accepts nothing.
+        return OAuthTokenVerifier(oauth_config)
 
     if netbox_config.token_passthrough:
         if transport_config.transport_type not in HTTP_TRANSPORTS:

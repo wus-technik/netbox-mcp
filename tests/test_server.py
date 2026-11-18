@@ -20,7 +20,6 @@ from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddlewa
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.server.transforms.search import RegexSearchTransform
 
-from netbox_mcp.auth import DenyAllTokenVerifier
 from netbox_mcp.auth import NetBoxTokenVerifier
 
 MODULE = "netbox_mcp.server"
@@ -260,23 +259,6 @@ def test_token_passthrough_enables_netbox_auth(load_server):
     server = load_server(MCP_TRANSPORT="http", NETBOX_TOKEN_PASSTHROUGH="true")
 
     assert isinstance(server.mcp.auth, NetBoxTokenVerifier)
-
-
-def test_main_refuses_oauth_mode_until_implemented(load_server, monkeypatch, tmp_path):
-    from tests.oauth.conftest import OAUTH_ENV
-
-    for name, value in OAUTH_ENV.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.setenv("OAUTH_STATE_PATH", str(tmp_path / "state.json"))
-    server = load_server(MCP_TRANSPORT="http")
-
-    with pytest.raises(SystemExit) as exc:
-        server.main()
-
-    assert exc.value.code == 1
-    server.mcp.run.assert_not_called()
-    # `fastmcp run` skips main(), so the import itself must deny every token.
-    assert isinstance(server.mcp.auth, DenyAllTokenVerifier)
 
 
 def test_main_runs_stdio_by_default(load_server, caplog):
