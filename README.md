@@ -572,6 +572,7 @@ Setting `OIDC_ISSUER` turns on OAuth mode, in which the server acts as its own O
 | `OIDC_EXTRA_SCOPES` | no | Extra scopes to request, comma-separated |
 | `EXTRA_REDIRECT_URIS`, `EXTRA_ORIGINS` | no | Extra allowed redirect URIs and web origins, comma-separated |
 | `NETBOX_USER_DENYLIST` | no | NetBox usernames that may never sign in, comma-separated |
+| `OAUTH_MAX_SESSION_DAYS` | no | Maximum age of a session in days, independent of the 30-day refresh window; afterwards the user signs in again (default `365`, at least `1`) |
 | `AUTH_DEBUG` | no | Log more detail about sign-ins, never secrets (default `false`) |
 
 OAuth mode needs `MCP_TRANSPORT=http` and cannot be combined with `NETBOX_TOKEN_PASSTHROUGH` or `MCP_HTTP_BEARER_TOKEN`. `NETBOX_TOKEN` is ignored.

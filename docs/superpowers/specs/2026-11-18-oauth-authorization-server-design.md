@@ -291,6 +291,13 @@ Integration into the existing server:
   background jobs never extend it. `client_id` is optional on refresh
   (RFC 6749 §6) but must match the session's client if sent. `resource`, if
   sent, follows the §5.3 rule.
+- **Absolute session cap** (maintainer decision 2026-11-18): spent hashes are
+  kept for the session's whole lifetime, so a session also ends
+  `OAUTH_MAX_SESSION_DAYS` (default 365, at least 1) after its creation; the
+  next refresh gets `invalid_grant` and the user logs in again. Token and code
+  lookups use an in-memory hash → session index, built from the store at first
+  use and updated only after a successful write; every hit is re-checked
+  against the session under its lock.
 - Every refresh first runs the IdP eligibility check of §6.4; only an
   eligible result rotates the tokens.
 - **Replay window (exact rule, as in the reference):** the session keeps one
@@ -495,7 +502,9 @@ Rules:
   token, NetBox token with ID, expiry and `tokenVersion`), pending-create
   markers, cleanup queue.
 - Expected scale (tens of users, a few sessions each) makes a whole-file
-  rewrite per change acceptable.
+  rewrite per change acceptable. A session's spent refresh hashes stay until
+  it ends; the absolute cap `OAUTH_MAX_SESSION_DAYS` (§5.4) bounds that list.
+  The hash lookup index lives only in memory and is rebuilt from the file.
 - Backup: the file plus the key, stored separately.
 - **Restore** (offline commands, documented procedure):
   1. `netbox-mcp oauth restore-reset`: ends **all** restored sessions and
@@ -513,7 +522,7 @@ OAuth mode is on when `OIDC_ISSUER` is set. Then required:
 (≥ 32 bytes), `OAUTH_STATE_KEY`, `OAUTH_STATE_PATH`. Optional:
 `OIDC_USERNAME_CLAIM`, `OIDC_GROUPS_CLAIM` (default `groups`),
 `OIDC_EXTRA_SCOPES`, `EXTRA_REDIRECT_URIS`, `EXTRA_ORIGINS`,
-`NETBOX_USER_DENYLIST`, `AUTH_DEBUG`. Missing or invalid values → startup
+`NETBOX_USER_DENYLIST`, `OAUTH_MAX_SESSION_DAYS`, `AUTH_DEBUG`. Missing or invalid values → startup
 fails.
 
 OAuth mode is mutually exclusive with `NETBOX_TOKEN_PASSTHROUGH` and

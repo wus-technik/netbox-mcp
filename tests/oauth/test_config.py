@@ -143,3 +143,17 @@ def test_oauth_requires_http_transport(oauth_config, kind):
         build_auth_provider(
             _netbox(), TransportConfig(transport_type=kind), oauth_config
         )
+
+
+def test_max_session_days_default_and_override(env):
+    env.delenv("OAUTH_MAX_SESSION_DAYS", raising=False)
+    assert get_oauth_config_from_env().max_session_days == 365
+    env.setenv("OAUTH_MAX_SESSION_DAYS", "1")
+    assert get_oauth_config_from_env().max_session_days == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc"])
+def test_max_session_days_invalid(env, value):
+    env.setenv("OAUTH_MAX_SESSION_DAYS", value)
+    with pytest.raises(ValueError, match="OAUTH_MAX_SESSION_DAYS"):
+        get_oauth_config_from_env()

@@ -820,9 +820,13 @@ async def test_failed_store_answers_503_on_token(
     resp = await refresh(http, body["refresh_token"])
     assert_error(resp, 503, "temporarily_unavailable")
     # The store is now failed: snapshot() raises, still answered as JSON 503.
+    # Known tokens reach the store, whose snapshot() now raises StoreError.
     for path, data in (
-        (TOKEN, {"grant_type": "refresh_token", "refresh_token": "x"}),
-        (REVOKE, {"token": "x"}),
+        (
+            TOKEN,
+            {"grant_type": "refresh_token", "refresh_token": body["refresh_token"]},
+        ),
+        (REVOKE, {"token": body["refresh_token"]}),
     ):
         resp = await http.post(path, data=data)
         assert_error(resp, 503, "temporarily_unavailable")
@@ -921,3 +925,107 @@ async def test_code_resource_binding_mismatch_invalid_target(
     assert_error(resp, 400, "invalid_target")
     assert only_session(store).code_hash is None
     assert_error(await exchange(http, client_id, code), 400, "invalid_grant")
+
+
+# ------------------------------------------------------------ fix round 2
+
+
+async def test_index_follows_rotation_and_session_end(
+    http, store, fake_idp, manager
+) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    sid = only_session(store).sid
+    assert manager._lookup(hash_secret(code)) == sid
+    a = (await exchange(http, client_id, code)).json()
+    assert manager._lookup(hash_secret(code)) is None
+    b = (await refresh(http, a["refresh_token"])).json()
+    c = (await refresh(http, b["refresh_token"])).json()
+    hashes = [hash_secret(t["refresh_token"]) for t in (a, b, c)]
+    assert [manager._lookup(h) for h in hashes] == [sid, sid, sid]
+    # Replay of b (slot) and reuse of a still resolve to the session.
+    replay = await refresh(http, b["refresh_token"])
+    assert replay.json() == c
+    assert_error(await refresh(http, a["refresh_token"]), 400, "invalid_grant")
+    assert store.snapshot().sessions == {}
+    assert [manager._lookup(h) for h in hashes] == [None, None, None]
+
+
+async def test_index_rebuilt_after_reopen(
+    http, store, fake_idp, fake_netbox_tokens, oauth_config
+) -> None:
+    _, a = await tokens_for(http, fake_idp)
+    b = await refresh(http, a["refresh_token"])
+    store.close()
+    reopened = StateStore.open(oauth_config.state_path, oauth_config.state_key)
+    try:
+        manager2 = await build_manager(
+            oauth_config, reopened, fake_idp, fake_netbox_tokens
+        )
+        async with app_client(oauth_config, manager2) as http2:
+            replay = await refresh(http2, a["refresh_token"])
+            assert replay.json() == b.json()
+            nxt = await refresh(http2, b.json()["refresh_token"])
+            assert nxt.status_code == 200, nxt.text
+    finally:
+        reopened.close()
+
+
+async def test_stale_index_entry_is_unknown_and_dropped(
+    http, store, fake_idp, manager
+) -> None:
+    _, a = await tokens_for(http, fake_idp)
+    sid = only_session(store).sid
+    stale = hash_secret("stale-token")
+    manager._index()[stale] = sid
+    assert_error(await refresh(http, "stale-token"), 400, "invalid_grant")
+    assert stale not in manager._index()
+    assert len(store.snapshot().sessions) == 1
+    resp = await http.post(REVOKE, data={"token": "stale-token"})
+    assert resp.status_code == 200
+    manager._index()[stale] = sid
+    assert (await http.post(REVOKE, data={"token": "stale-token"})).status_code == 200
+    assert len(store.snapshot().sessions) == 1
+    assert (await refresh(http, a["refresh_token"])).status_code == 200
+
+
+async def test_refresh_lookup_does_not_scan_sessions(
+    http, store, fake_idp, manager, monkeypatch
+) -> None:
+    await tokens_for(http, fake_idp)
+    manager._index()  # built
+    calls = []
+    original = store.snapshot
+
+    def counting():
+        calls.append(1)
+        return original()
+
+    monkeypatch.setattr(store, "snapshot", counting)
+    assert_error(await refresh(http, "unknown-token"), 400, "invalid_grant")
+    assert calls == []
+
+
+def test_default_max_session_days(oauth_config) -> None:
+    assert oauth_config.max_session_days == 365
+
+
+async def test_max_session_age_boundaries(
+    http, store, fake_idp, manager, clock, caplog
+) -> None:
+    manager.config.max_session_days = 60
+    _, a = await tokens_for(http, fake_idp)
+    created = only_session(store).created_at
+    clock.advance(created + 29 * DAY - clock())
+    b = (await refresh(http, a["refresh_token"])).json()
+    clock.advance(created + 58 * DAY - clock())
+    c = (await refresh(http, b["refresh_token"])).json()
+    clock.advance(created + 60 * DAY - 1 - clock())
+    d = await refresh(http, c["refresh_token"])
+    assert d.status_code == 200, d.text
+    clock.advance(1)  # exactly 60 days after creation
+    caplog.set_level(logging.INFO)
+    late = await refresh(http, d.json()["refresh_token"])
+    assert_error(late, 400, "invalid_grant")
+    assert store.snapshot().sessions == {}
+    assert len(store.snapshot().cleanup) >= 1
+    assert "reason=max_age" in caplog.text

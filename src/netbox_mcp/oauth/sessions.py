@@ -124,6 +124,11 @@ class SessionManager:
         )
         # Set whenever a cleanup entry is enqueued; the background job waits on it.
         self.cleanup_wanted = asyncio.Event()
+        # hash -> sid for code, current, replay-slot and spent refresh hashes.
+        # Built from the store on first use and updated only after the store
+        # write succeeded, so it never runs ahead of disk. Entries are hints:
+        # every hit is re-checked against the session under its lock.
+        self._hash_index: dict[str, str] | None = None
 
     # ------------------------------------------------------------------ locks
 
@@ -339,6 +344,7 @@ class SessionManager:
         async with self.store.mutate() as state:
             state.sessions[sid] = session
             state.pending.pop(nonce, None)
+        self._index_add(token_time.hash_secret(code), sid)
         logger.info("oauth session created sid=%s", sid[:8])
         return session.model_copy(deep=True), code
 
@@ -440,8 +446,53 @@ class SessionManager:
                     k for k, g in state.grants.items() if g.user_key == session.user_key
                 ]:
                     del state.grants[key]
+            ended = session
+        self._index_drop(*self._session_hashes(ended))
         logger.info("session_ended sid=%s reason=%s", sid[:8], reason)
         self.cleanup_wanted.set()
+
+    # -------------------------------------------------------------- hash index
+
+    @staticmethod
+    def _session_hashes(session: Session) -> list[str]:
+        hashes = list(session.spent_hashes)
+        if session.code_hash is not None:
+            hashes.append(session.code_hash)
+        if session.refresh_hash is not None:
+            hashes.append(session.refresh_hash)
+        if session.replay is not None:
+            hashes.append(session.replay.hash)
+        return hashes
+
+    @staticmethod
+    def _holds_refresh(session: Session, token_hash: str) -> bool:
+        return (
+            session.refresh_hash == token_hash
+            or (session.replay is not None and session.replay.hash == token_hash)
+            or token_hash in session.spent_hashes
+        )
+
+    def _index(self) -> dict[str, str]:
+        if self._hash_index is None:
+            index: dict[str, str] = {}
+            for session in self.store.snapshot().sessions.values():
+                for value in self._session_hashes(session):
+                    index[value] = session.sid
+            self._hash_index = index
+        return self._hash_index
+
+    def _index_add(self, value: str, sid: str) -> None:
+        if self._hash_index is not None:
+            self._hash_index[value] = sid
+
+    def _index_drop(self, *values: str) -> None:
+        if self._hash_index is not None:
+            for value in values:
+                self._hash_index.pop(value, None)
+
+    def _lookup(self, value: str) -> str | None:
+        """Session ID for a hash, or None. Verify under the session lock."""
+        return self._index().get(value)
 
     # ------------------------------------------------------------ token grants
 
@@ -483,11 +534,17 @@ class SessionManager:
         sid = self._session_by_code(code_hash)
         if sid is None:
             return
-        async with self.lock_for(sid), self.store.mutate() as state:
-            stored = state.sessions.get(sid)
-            if stored is None or stored.code_hash != code_hash:
+        async with self.lock_for(sid):
+            current = self.store.snapshot().sessions.get(sid)
+            if current is None or current.code_hash != code_hash:
+                self._index_drop(code_hash)
                 return
-            self._clear_code(stored)
+            async with self.store.mutate() as state:
+                stored = state.sessions.get(sid)
+                if stored is None or stored.code_hash != code_hash:
+                    return
+                self._clear_code(stored)
+            self._index_drop(code_hash)
         logger.warning("code_rejected sid=%s error=invalid_request", sid[:8])
 
     @staticmethod
@@ -499,12 +556,7 @@ class SessionManager:
         session.code_resource = None
 
     def _session_by_code(self, code_hash: str) -> str | None:
-        for session in self.store.snapshot().sessions.values():
-            if session.code_hash is not None and hmac.compare_digest(
-                session.code_hash, code_hash
-            ):
-                return session.sid
-        return None
+        return self._lookup(code_hash)
 
     async def redeem_code(
         self,
@@ -532,6 +584,7 @@ class SessionManager:
         async with self.lock_for(sid):
             session = self.store.snapshot().sessions.get(sid)
             if session is None or session.code_hash != code_hash:
+                self._index_drop(code_hash)
                 raise GrantError("invalid_grant", "unknown, used or expired code")
             now = token_time.now()
             problem: GrantError | None = None
@@ -567,6 +620,9 @@ class SessionManager:
                     client = state.clients.get(stored.client_id)
                     if client is not None:
                         client.last_used_at = now
+            self._index_drop(code_hash)
+            if problem is None:
+                self._index_add(token_time.hash_secret(refresh_token), sid)
         if problem is not None:
             logger.warning(
                 "code_rejected sid=%s error=%s reason=%s",
@@ -580,14 +636,7 @@ class SessionManager:
 
     def _session_by_refresh(self, token_hash: str) -> str | None:
         """Session holding this refresh token as current, replay slot or spent."""
-        for session in self.store.snapshot().sessions.values():
-            if (
-                session.refresh_hash == token_hash
-                or (session.replay is not None and session.replay.hash == token_hash)
-                or token_hash in session.spent_hashes
-            ):
-                return session.sid
-        return None
+        return self._lookup(token_hash)
 
     def _refresh_rejected(self, sid: str | None, reason: str) -> GrantError:
         logger.warning(
@@ -635,8 +684,10 @@ class SessionManager:
     ) -> dict:
         snap = self.store.snapshot()
         session = snap.sessions.get(sid)
-        if session is None:
-            raise self._refresh_rejected(sid, "session_ended")
+        if session is None or not self._holds_refresh(session, token_hash):
+            # Stale index entry: the token is unknown.
+            self._index_drop(token_hash)
+            raise self._refresh_rejected(sid, "unknown_token")
         if session.idp_refresh_started_at is not None:
             # A previous IdP refresh has an unknown outcome (crash before its
             # result was stored): the stored IdP token may be spent. Checked
@@ -644,6 +695,11 @@ class SessionManager:
             await self.end_session_locked(sid, "idp_refresh_unknown")
             raise self._refresh_rejected(sid, "idp_refresh_unknown")
         now = token_time.now()
+        if now - session.created_at >= self.config.max_session_days * 86400:
+            # Absolute cap: the sliding deadline alone would let a session
+            # (and its list of spent hashes) live forever.
+            await self.end_session_locked(sid, "max_age")
+            raise self._refresh_rejected(sid, "max_age")
         replay = session.replay
         if session.refresh_hash != token_hash:
             if (
@@ -655,12 +711,9 @@ class SessionManager:
                     raise self._refresh_rejected(sid, "client_mismatch")
                 logger.info("token_replayed sid=%s", sid[:8])
                 return dict(replay.response)
-            if token_hash in session.spent_hashes or (
-                replay is not None and replay.hash == token_hash
-            ):
-                await self.end_session_locked(sid, "refresh_reuse")
-                raise self._refresh_rejected(sid, "refresh_reuse")
-            raise self._refresh_rejected(sid, "unknown_token")
+            # Spent token (or the replay slot after its window).
+            await self.end_session_locked(sid, "refresh_reuse")
+            raise self._refresh_rejected(sid, "refresh_reuse")
         if client_id is not None and client_id != session.client_id:
             raise self._refresh_rejected(sid, "client_mismatch")
         if now >= session.refresh_deadline:
@@ -693,6 +746,7 @@ class SessionManager:
             name = client.client_name if client else "-"
             if client is not None:
                 client.last_used_at = now
+        self._index_add(token_time.hash_secret(refresh_token), sid)
         logger.info("token_refreshed sid=%s client=%s", sid[:8], name or "-")
         return response
 
@@ -777,16 +831,23 @@ class SessionManager:
         """
         sid: str | None = None
         owner: str | None = None
+        token_hash: str | None = None
         try:
             claims = self.tokens.verify(token, allow_expired=True)
         except InvalidToken:
-            sid = self._session_by_refresh(token_time.hash_secret(token))
+            token_hash = token_time.hash_secret(token)
+            sid = self._session_by_refresh(token_hash)
         else:
             sid, owner = claims["sid"], claims["client_id"]
         if sid is None:
             return
         async with self.lock_for(sid):
             session = self.store.snapshot().sessions.get(sid)
+            if token_hash is not None and (
+                session is None or not self._holds_refresh(session, token_hash)
+            ):
+                self._index_drop(token_hash)
+                return
             if session is None:
                 return
             if owner is not None and owner != session.client_id:

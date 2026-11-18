@@ -15,12 +15,14 @@ from pydantic import Field
 from pydantic import SecretStr
 
 from netbox_mcp.utils import env_bool
+from netbox_mcp.utils import env_int
 from netbox_mcp.utils import env_str
 
 # Plain http is accepted for the public URL only on these literal loopback hosts.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 MIN_SIGNING_KEY_BYTES = 32
 STATE_KEY_BYTES = 32
+DEFAULT_MAX_SESSION_DAYS = 365
 
 
 class OAuthConfig(BaseModel):
@@ -42,6 +44,8 @@ class OAuthConfig(BaseModel):
     extra_origins: list[str] = []
     user_denylist: set[str] = set()
     auth_debug: bool = False
+    # Absolute session lifetime; afterwards a new login is needed.
+    max_session_days: int = DEFAULT_MAX_SESSION_DAYS
 
     @property
     def base_path(self) -> str:
@@ -132,6 +136,10 @@ def get_oauth_config_from_env() -> OAuthConfig | None:
             f"OAUTH_STATE_PATH: directory {str(state_path.parent)!r} does not exist"
         )
 
+    max_session_days = env_int("OAUTH_MAX_SESSION_DAYS", DEFAULT_MAX_SESSION_DAYS)
+    if max_session_days < 1:
+        raise ValueError("OAUTH_MAX_SESSION_DAYS must be at least 1")
+
     return OAuthConfig(
         public_url=public_url,
         issuer_url=issuer,
@@ -149,4 +157,5 @@ def get_oauth_config_from_env() -> OAuthConfig | None:
         extra_origins=_csv(env_str("EXTRA_ORIGINS")),
         user_denylist=set(_csv(env_str("NETBOX_USER_DENYLIST"))),
         auth_debug=env_bool("AUTH_DEBUG", False),
+        max_session_days=max_session_days,
     )
