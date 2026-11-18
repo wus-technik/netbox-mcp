@@ -1,6 +1,10 @@
 # OIDC authentication with personal NetBox tokens
 
-Status: proposed design; implementation and integration tests are outstanding.
+Status: **superseded** on 2026-11-18 by
+[OAuth authorization server with per-session NetBox tokens](2026-11-18-oauth-authorization-server-design.md).
+Kept for its NetBox permission, broker-client and lifecycle analysis.
+
+Former status: proposed design; implementation and integration tests are outstanding.
 **Blocked** until an Authentik release provides the features listed under
 "Provider prerequisite" below.
 
