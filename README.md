@@ -635,7 +635,7 @@ Setting `OIDC_ISSUER` turns OAuth mode on. A missing or invalid value stops star
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
-| `OIDC_ISSUER` | yes | Issuer URL of the identity provider; turns OAuth mode on |
+| `OIDC_ISSUER` | yes | Issuer URL of the identity provider, exactly as the IdP publishes it (with or without trailing slash); `https` (plain `http` only for a loopback host), no credentials, query or fragment. Turns OAuth mode on |
 | `MCP_PUBLIC_URL` | yes | Public URL of the MCP endpoint, e.g. `https://mcp.example.com/mcp`; issuer and resource of this server. https (http only on loopback), no trailing slash, query or credentials |
 | `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | yes | Confidential client registered at the identity provider |
 | `OIDC_ALLOWED_GROUPS` | yes | Comma-separated groups whose members may sign in |
@@ -680,9 +680,9 @@ OAuth mode needs `MCP_TRANSPORT=http` and cannot be combined with `NETBOX_TOKEN_
 
 ### Endpoints and request rules
 
-- Discovery: protected-resource metadata at `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp` and `<base>/.well-known/oauth-protected-resource`; authorization-server metadata at `/.well-known/oauth-authorization-server[/mcp]`, `<base>/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration/mcp` and `<base>/.well-known/openid-configuration`. There is deliberately no root `/.well-known/openid-configuration`, so a NetBox on the same host is not shadowed.
+- Discovery (`<base>` is the path of `MCP_PUBLIC_URL`; the `/mcp` forms show the example base path `/mcp` and follow your own base path): protected-resource metadata at `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp` and `<base>/.well-known/oauth-protected-resource`; authorization-server metadata at `/.well-known/oauth-authorization-server[/mcp]`, `<base>/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration/mcp` and `<base>/.well-known/openid-configuration`. There is deliberately no root `/.well-known/openid-configuration`, so a NetBox on the same host is not shadowed.
 - OAuth endpoints under `<base>/oauth/` (`register`, `authorize`, `token`, `revoke`, plus the IdP `callback` and the consent page), with root aliases `/register`, `/authorize`, `/token`, `/revoke` and `/oauth/revoke` for clients that ignore the base path. The only scope is `netbox`.
-- Redirect URIs a client may register: loopback `http://localhost:<port>/…` and `http://127.0.0.1:<port>/…`, the claude.ai/claude.com and ChatGPT callbacks, and `EXTRA_REDIRECT_URIS`.
+- Redirect URIs a client may register: loopback `http://localhost:<port>/<path>` and `http://127.0.0.1:<port>/<path>`, the claude.ai/claude.com and ChatGPT callbacks, and `EXTRA_REDIRECT_URIS`.
 - Registration is rate-limited to 10 per minute per client address, with at most 1,000 stored registrations. The limit lives in memory, per process, and is keyed by the address of the TCP peer: **behind a reverse proxy all clients share one limit**.
 - `/mcp`: without a valid token every request gets 401 with a `WWW-Authenticate` challenge pointing at the metadata. Requests with an `Origin` header are only accepted from `https://claude.ai`, `https://claude.com`, `https://chatgpt.com`, the origin of `MCP_PUBLIC_URL` and `EXTRA_ORIGINS` (403 otherwise). FastMCP's own Host/Origin protection is switched off in OAuth mode; this allowlist is the only Origin check, and the `Host` header is not checked (set it at the reverse proxy). Only `POST` is served (`GET`/`DELETE` → 405); the transport is stateless.
 - `GET /health` answers without a token, as in the other HTTP modes.
@@ -721,6 +721,10 @@ docker run -d -p 8000:8000 -v netbox-mcp-state:/data --env-file .env ghcr.io/mha
 ```
 
 with `OAUTH_STATE_PATH=/data/oauth-state.json`. The image's entry point is `netbox-mcp`, so the admin commands are passed as arguments the same way (`oauth unlink <user>`, `oauth sweep`), while the server container is stopped.
+
+### Known limits
+
+- Writes to the state file are atomic (write a temporary file, fsync, rename, fsync the directory). If the directory fsync fails after the rename on Linux or another POSIX system, the server cannot tell whether the change is durable: it answers 503 and marks the store failed until restart. When that change was a refresh-token rotation, the new state is the one on disk after the restart, so the client's retry with its previous refresh token counts as reuse and ends the session; the user logs in again. Nothing is granted that should not be. Windows does not fsync directories, so this case does not arise there.
 
 ### Logging
 
