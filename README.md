@@ -553,6 +553,29 @@ claude mcp add --transport http netbox https://netbox-mcp.example.com/mcp \
 - With `NETBOX_PLUGIN_DISCOVERY=true`, plugin types found with any user's token are added to one shared list. `rediscover` replaces that list with what the calling user can see, which drops uninstalled plugins; another user's call that names a type only they can see rediscovers it with their token.
 - Clients send their NetBox tokens to this server, so put it behind HTTPS.
 
+#### OAuth mode (work in progress)
+
+Setting `OIDC_ISSUER` turns on OAuth mode, in which the server acts as its own OAuth authorization server and signs users in through an OpenID Connect identity provider. The server does not start in this mode yet; only the configuration is validated. A missing or invalid value stops startup and names the variable.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `OIDC_ISSUER` | yes | Issuer URL of the identity provider; turns OAuth mode on |
+| `MCP_PUBLIC_URL` | yes | Public URL of the MCP endpoint, e.g. `https://mcp.example.com/mcp`. https (http only on loopback), no trailing slash, query or credentials |
+| `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | yes | Confidential client registered at the identity provider |
+| `OIDC_ALLOWED_GROUPS` | yes | Comma-separated groups whose members may sign in |
+| `NETBOX_TOKEN_BROKER_TOKEN` | yes | NetBox token of the service account that creates per-session user tokens |
+| `OAUTH_SIGNING_KEY` | yes | Base64 key that signs access tokens, at least 32 bytes decoded (`openssl rand -base64 32`) |
+| `OAUTH_STATE_KEY` | yes | Base64 key, exactly 32 bytes decoded, that encrypts the session store |
+| `OAUTH_STATE_PATH` | yes | File of the encrypted session store; its directory must exist |
+| `OIDC_USERNAME_CLAIM` | no | Claim holding the username (default `preferred_username`) |
+| `OIDC_GROUPS_CLAIM` | no | Claim holding the groups (default `groups`) |
+| `OIDC_EXTRA_SCOPES` | no | Extra scopes to request, comma-separated |
+| `EXTRA_REDIRECT_URIS`, `EXTRA_ORIGINS` | no | Extra allowed redirect URIs and web origins, comma-separated |
+| `NETBOX_USER_DENYLIST` | no | NetBox usernames that may never sign in, comma-separated |
+| `AUTH_DEBUG` | no | Log more detail about sign-ins, never secrets (default `false`) |
+
+OAuth mode needs `MCP_TRANSPORT=http` and cannot be combined with `NETBOX_TOKEN_PASSTHROUGH` or `MCP_HTTP_BEARER_TOKEN`. `NETBOX_TOKEN` is ignored.
+
 **Note**: The HTTP transport requires proper JSON-RPC formatting with `jsonrpc` and `id` fields. The server may also require session initialization for some operations.
 
 #### Health Endpoint

@@ -25,6 +25,7 @@ from netbox_mcp.auth import build_auth_provider
 from netbox_mcp.auth import rate_limit_client_id
 from netbox_mcp.netbox_client import get_netbox_config_from_env
 from netbox_mcp.netbox_client import get_transport_config_from_env
+from netbox_mcp.oauth.config import get_oauth_config_from_env
 from netbox_mcp.sentry_init import init_sentry
 from netbox_mcp.tools import register_tools
 from netbox_mcp.utils import HEALTH_PATH
@@ -69,7 +70,8 @@ except PackageNotFoundError:
 try:
     NETBOX_CONFIG = get_netbox_config_from_env()
     TRANSPORT_CONFIG = get_transport_config_from_env()
-    auth_provider = build_auth_provider(NETBOX_CONFIG, TRANSPORT_CONFIG)
+    OAUTH_CONFIG = get_oauth_config_from_env()
+    auth_provider = build_auth_provider(NETBOX_CONFIG, TRANSPORT_CONFIG, OAUTH_CONFIG)
 except Exception as e:
     logger.error(f"Invalid configuration: {e}")
     raise
@@ -188,6 +190,12 @@ if NETBOX_CONFIG.rate_limit_enabled:
 
 
 def main():
+    # Fail closed: OAuth mode has no verifier yet, so starting would serve the
+    # tools unauthenticated.
+    if OAUTH_CONFIG is not None:
+        logger.error("OAuth mode (OIDC_ISSUER) is not implemented yet.")
+        raise SystemExit(1)
+
     # A typo must not fall back to stdio: the HTTP port would never open while
     # the container healthcheck, which skips non-HTTP transports, kept reporting
     # healthy. Checked here rather than at import, because `fastmcp run` imports

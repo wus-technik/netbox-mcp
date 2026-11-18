@@ -27,6 +27,7 @@ from netbox_mcp.netbox_client import NetBoxAPIError
 from netbox_mcp.netbox_client import NetBoxClient
 from netbox_mcp.netbox_client import bounded_put
 from netbox_mcp.netbox_client import token_fingerprint
+from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.utils import HTTP_TRANSPORTS
 
 logger = logging.getLogger(__name__)
@@ -331,22 +332,42 @@ def rate_limit_client_id(_context: object) -> str:
 
 
 def build_auth_provider(
-    netbox_config: NetBoxConfig, transport_config: TransportConfig
+    netbox_config: NetBoxConfig,
+    transport_config: TransportConfig,
+    oauth_config: OAuthConfig | None = None,
 ) -> AuthProvider | None:
     """Choose how MCP clients authenticate to this server.
 
     Args:
         netbox_config: NetBox connection settings.
         transport_config: MCP transport settings.
+        oauth_config: OAuth mode settings, or None when OAuth mode is off.
 
     Returns:
         AuthProvider | None: A NetBox token verifier with token passthrough, a
             static bearer token verifier with MCP_HTTP_BEARER_TOKEN, else None.
+            In OAuth mode None as well, until the OAuth verifier exists.
 
     Raises:
         ValueError: If token passthrough is combined with stdio or with
-            MCP_HTTP_BEARER_TOKEN.
+            MCP_HTTP_BEARER_TOKEN, or OAuth mode with passthrough, a static
+            bearer token or a transport other than http.
     """
+    if oauth_config is not None:
+        if netbox_config.token_passthrough:
+            raise ValueError(
+                "OIDC_ISSUER (OAuth mode) and NETBOX_TOKEN_PASSTHROUGH are "
+                "mutually exclusive"
+            )
+        if transport_config.http_bearer_token:
+            raise ValueError(
+                "OIDC_ISSUER (OAuth mode) and MCP_HTTP_BEARER_TOKEN are "
+                "mutually exclusive"
+            )
+        if transport_config.transport_type != "http":
+            raise ValueError("OIDC_ISSUER (OAuth mode) requires MCP_TRANSPORT=http")
+        return None
+
     if netbox_config.token_passthrough:
         if transport_config.transport_type not in HTTP_TRANSPORTS:
             raise ValueError(

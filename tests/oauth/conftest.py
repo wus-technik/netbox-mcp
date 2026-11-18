@@ -1,0 +1,50 @@
+import base64
+from pathlib import Path
+
+import pytest
+
+from netbox_mcp.oauth.config import OAuthConfig
+
+OAUTH_ENV = {
+    "OIDC_ISSUER": "https://idp.example.com/realm",
+    "MCP_PUBLIC_URL": "https://mcp.example.com/mcp",
+    "OIDC_CLIENT_ID": "netbox-mcp",
+    "OIDC_CLIENT_SECRET": "client-secret",
+    "OIDC_ALLOWED_GROUPS": "netbox-users",
+    "NETBOX_TOKEN_BROKER_TOKEN": "nbt_broker.secret",
+    "OAUTH_SIGNING_KEY": base64.b64encode(b"s" * 32).decode(),
+    "OAUTH_STATE_KEY": base64.b64encode(b"k" * 32).decode(),
+}
+
+
+@pytest.fixture
+def oauth_config(tmp_path: Path) -> OAuthConfig:
+    return OAuthConfig(
+        public_url="https://mcp.example.com/mcp",
+        issuer_url="https://idp.example.com/realm",
+        client_id="netbox-mcp",
+        client_secret="client-secret",
+        allowed_groups=["netbox-users"],
+        broker_token="nbt_broker.secret",
+        signing_key=OAUTH_ENV["OAUTH_SIGNING_KEY"],
+        state_key=b"k" * 32,
+        state_path=tmp_path / "state.json",
+    )
+
+
+class Clock:
+    """A settable time source; later tasks wire it into the code under test."""
+
+    def __init__(self, start: float = 1_800_000_000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
