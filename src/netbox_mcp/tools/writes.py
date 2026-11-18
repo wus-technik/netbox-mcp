@@ -60,6 +60,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Create a NetBox object",
         tags={"netbox", "write"},
         annotations=CREATE_ANNOTATIONS,
     )
@@ -89,6 +90,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Update a NetBox object",
         tags={"netbox", "write"},
         annotations=UPDATE_ANNOTATIONS,
     )
@@ -134,6 +136,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Create NetBox objects in bulk",
         tags={"netbox", "write"},
         annotations=CREATE_ANNOTATIONS,
     )
@@ -174,6 +177,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Update NetBox objects in bulk",
         tags={"netbox", "write"},
         annotations=UPDATE_ANNOTATIONS,
     )
@@ -236,6 +240,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Allocate the next available IP, prefix, VLAN or ASN",
         tags={"netbox", "write", "ipam"},
         annotations=CREATE_ANNOTATIONS,
     )
@@ -285,6 +290,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Delete a NetBox object",
         tags={"netbox", "delete"},
         annotations=DELETE_ANNOTATIONS,
     )
@@ -321,6 +327,7 @@ def register_writes_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Delete NetBox objects in bulk",
         tags={"netbox", "delete"},
         annotations=DELETE_ANNOTATIONS,
     )

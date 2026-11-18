@@ -2,14 +2,21 @@
 Shared argument types, annotations and response helpers for NetBox tools.
 """
 
+import functools
 import inspect
 from collections.abc import Callable
 from collections.abc import Iterable
 from typing import Annotated
 from typing import Any
 
+from fastmcp.exceptions import DisabledError
+from fastmcp.exceptions import NotFoundError
+from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool
+from fastmcp.tools import ToolResult
 from fastmcp.tools.tool_transform import ArgTransform
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_PARAMS
 from pydantic import Field
 
 from netbox_mcp.models import NetBoxConfig
@@ -48,6 +55,11 @@ RUN_ANNOTATIONS = {
     "idempotentHint": False,
     "openWorldHint": True,
 }
+
+# ChatGPT cannot render a tool result whose data object has a key named
+# "content" (it collides with the MCP result envelope). Structured results
+# rename it; the text content keeps the NetBox data unchanged.
+CONTENT_KEY_RENAME = "content_value"
 
 # NetBox added ?omit= in 4.5.2.
 OMIT_MIN_VERSION = (4, 5, 2)
@@ -94,6 +106,62 @@ BriefArg = Annotated[
 ]
 
 
+def rename_content_keys(value: Any) -> Any:
+    """Rename every dict key ``content`` to ``CONTENT_KEY_RENAME``, recursively.
+
+    Args:
+        value: Any JSON-like value.
+
+    Returns:
+        Any: A copy with the keys renamed; scalars are returned unchanged.
+    """
+    if isinstance(value, dict):
+        return {
+            (CONTENT_KEY_RENAME if key == "content" else key): rename_content_keys(
+                child
+            )
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [rename_content_keys(child) for child in value]
+    return value
+
+
+class UnknownToolIsInvalidParams(Middleware):
+    """Answer a call to an unknown or disabled tool with JSON-RPC -32602.
+
+    FastMCP returns it as a result with ``isError`` set; the MCP specification
+    makes it a protocol error with its message.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except (NotFoundError, DisabledError) as e:
+            raise MCPError(
+                INVALID_PARAMS, f"Unknown tool: {context.message.name!r}"
+            ) from e
+
+
+def _structured(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a tool so its structured result has no ``content`` key.
+
+    The text content keeps the data exactly as the tool returned it; only the
+    structured copy gets the keys renamed. Results without such a key pass
+    through untouched.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = await fn(*args, **kwargs)
+        renamed = rename_content_keys(result)
+        if renamed == result:
+            return result
+        return ToolResult(content=result, structured_content=renamed)
+
+    return wrapper
+
+
 def netbox_tool(
     mcp, config: NetBoxConfig, **kwargs: Any
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -113,7 +181,7 @@ def netbox_tool(
     """
 
     def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-        tool = Tool.from_function(fn, **kwargs)
+        tool = Tool.from_function(_structured(fn), **kwargs)
         if (
             not config.branching_enabled
             and "branch" in inspect.signature(fn).parameters

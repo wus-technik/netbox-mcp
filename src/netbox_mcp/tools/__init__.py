@@ -8,6 +8,7 @@ from netbox_mcp.models import NetBoxConfig
 from netbox_mcp.tools.actions import register_actions_tools
 from netbox_mcp.tools.branching import register_branching_tools
 from netbox_mcp.tools.capacity import register_capacity_tools
+from netbox_mcp.tools.common import UnknownToolIsInvalidParams
 from netbox_mcp.tools.extras import register_extras_tools
 from netbox_mcp.tools.objects import register_objects_tools
 from netbox_mcp.tools.writes import register_writes_tools
@@ -24,6 +25,7 @@ def register_tools(
         transport: Transport for every NetBox request. None uses the shared
             network transport; tests pass an httpx2.MockTransport.
     """
+    mcp.add_middleware(UnknownToolIsInvalidParams())
     register_objects_tools(mcp, config, transport)
     register_extras_tools(mcp, config, transport)
     register_capacity_tools(mcp, config, transport)

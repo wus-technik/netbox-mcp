@@ -199,6 +199,7 @@ def register_capacity_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Find free rack space",
         tags={"netbox", "dcim", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -352,6 +353,7 @@ def register_capacity_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Get prefix utilization",
         tags={"netbox", "ipam", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )

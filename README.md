@@ -300,6 +300,12 @@ Object types are named `app.model`, as NetBox itself names them (`dcim.device`, 
 
 Every tool is tagged `netbox` plus a group tag, which `DISABLED_TAGS` can switch off: `objects`, `search`, `changelog`, `status`, `graphql`, `ipam`, `dcim`, `config`, `branching`, `scripts`, `write` and `delete`. Read tools also carry `read-only`.
 
+## Tool results
+
+Every tool has a human-readable `title`, annotations, and returns a JSON object as its structured result (list results are wrapped, e.g. `{"results": [...], "count": ...}`). Failures are returned as results with `isError` set; a call to an unknown or disabled tool is a JSON-RPC `-32602` (invalid params) error.
+
+ChatGPT cannot render a result whose data object has a key named `content`. In the structured result every `content` key, at any depth, is therefore renamed to `content_value`. This affects `netbox_render_config` (NetBox answers `{"content": "<rendered config>"}`) and any NetBox object that carries such a key in a nested field. The text content of the result keeps the NetBox data unchanged.
+
 ## 🔒 Security & Safety Features
 
 ### Read-Only Mode
