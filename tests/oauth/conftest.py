@@ -1,4 +1,5 @@
 import base64
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -35,16 +36,16 @@ def oauth_config(tmp_path: Path) -> OAuthConfig:
 
 
 class Clock:
-    """A settable time source; later tasks wire it into the code under test."""
+    """Time source offset from the real clock; ``advance`` moves it forward."""
 
-    def __init__(self, start: float = 1_800_000_000.0) -> None:
-        self.t = start
+    def __init__(self) -> None:
+        self.offset = 0.0
 
     def __call__(self) -> float:
-        return self.t
+        return time.time() + self.offset
 
     def advance(self, seconds: float) -> None:
-        self.t += seconds
+        self.offset += seconds
 
 
 @pytest.fixture

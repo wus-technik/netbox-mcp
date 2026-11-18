@@ -52,7 +52,7 @@ def test_access_token_claims(oauth_config, clock):
     assert claims["client_id"] == "c1"
     assert claims["scope"] == "netbox"
     assert claims["exp"] - claims["iat"] == 3600
-    assert claims["iat"] == int(clock())
+    assert abs(claims["iat"] - clock()) <= 2
     assert claims["jti"]
     assert tokens.verify(token)["sid"] == "s1"
 
@@ -109,3 +109,9 @@ def test_allow_expired_never_bypasses_signature(oauth_config):
         tokens.verify(_sign(oauth_config, aud="x"), allow_expired=True)
     with pytest.raises(InvalidToken):
         tokens.verify(_sign(oauth_config, sid=None), allow_expired=True)
+
+
+def test_allow_expired_still_requires_exp(oauth_config):
+    tokens = AccessTokens(oauth_config)
+    with pytest.raises(InvalidToken):
+        tokens.verify(_sign(oauth_config, exp=None), allow_expired=True)

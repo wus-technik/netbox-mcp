@@ -88,12 +88,9 @@ class AccessTokens:
             value = claims.get(name)
             if not isinstance(value, str) or not value:
                 raise InvalidToken(f"missing {name}")
-        if not allow_expired:
-            exp = claims.get("exp")
-            if (
-                isinstance(exp, bool)
-                or not isinstance(exp, (int, float))
-                or exp <= now()
-            ):
-                raise InvalidToken("token expired or without exp")
+        exp = claims.get("exp")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            raise InvalidToken("token without numeric exp")
+        if not allow_expired and exp <= now():
+            raise InvalidToken("token expired")
         return claims

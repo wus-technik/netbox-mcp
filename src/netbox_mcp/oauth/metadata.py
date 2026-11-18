@@ -69,14 +69,13 @@ def metadata_routes(config: OAuthConfig) -> list[Route]:
     async def as_endpoint(_request: Request) -> JSONResponse:
         return JSONResponse(as_doc)
 
-    prm_paths = [PRM_SUFFIX, f"{PRM_SUFFIX}{base}", f"{base}{PRM_SUFFIX}"]
-    as_paths = [
-        _AS,
-        f"{_AS}{base}",
-        f"{base}{_AS}",
-        f"{_OIDC}{base}",
-        f"{base}{_OIDC}",
-    ]
+    prm_paths = list(
+        dict.fromkeys([PRM_SUFFIX, f"{PRM_SUFFIX}{base}", f"{base}{PRM_SUFFIX}"])
+    )
+    as_paths = [_AS, f"{_AS}{base}", f"{base}{_AS}"]
+    if base:  # without a base path these would collapse onto a root OIDC document
+        as_paths += [f"{_OIDC}{base}", f"{base}{_OIDC}"]
+    as_paths = list(dict.fromkeys(as_paths))
     routes = [Route(p, prm_endpoint, methods=["GET"]) for p in prm_paths]
     routes += [Route(p, as_endpoint, methods=["GET"]) for p in as_paths]
     return routes

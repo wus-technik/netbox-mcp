@@ -80,3 +80,20 @@ def test_root_alias_paths():
         "/revoke",
         "/oauth/revoke",
     )
+
+
+def test_empty_base_path_has_no_root_openid_configuration(oauth_config):
+    cfg = oauth_config.model_copy(update={"public_url": "https://example.com"})
+    paths = [r.path for r in metadata_routes(cfg)]
+    assert len(paths) == len(set(paths))
+    assert "/.well-known/openid-configuration" not in paths
+    assert "/.well-known/oauth-authorization-server" in paths
+    assert "/.well-known/oauth-protected-resource" in paths
+    client = TestClient(Starlette(routes=metadata_routes(cfg)))
+    assert client.get("/.well-known/openid-configuration").status_code == 404
+    assert client.get("/.well-known/oauth-authorization-server").status_code == 200
+
+
+def test_mcp_base_path_route_set(oauth_config):
+    paths = sorted(r.path for r in metadata_routes(oauth_config))
+    assert paths == sorted(PRM + AS)

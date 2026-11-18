@@ -11,10 +11,8 @@ from urllib.parse import urlsplit
 
 MAX_URI_LENGTH = 2048
 
-_LOOPBACK_RE = re.compile(r"^http://(?:localhost|127\.0\.0\.1)(?::(\d{1,5}))?(?:/|$)")
-_LOOPBACK_PORT_RE = re.compile(
-    r"^(http://(?:localhost|127\.0\.0\.1))(?::\d{1,5})?(?=/|$)"
-)
+_LOOPBACK_RE = re.compile(r"^http://(?:localhost|127\.0\.0\.1):(\d{1,5})/")
+_LOOPBACK_PORT_RE = re.compile(r"^(http://(?:localhost|127\.0\.0\.1)):\d{1,5}(?=/)")
 _FIXED_URIS = frozenset(
     {
         "https://claude.ai/api/mcp/auth_callback",
@@ -60,7 +58,7 @@ def _is_loopback(uri: str) -> bool:
     if match is None:
         return False
     port = match.group(1)
-    return port is None or 0 < int(port) <= 65535
+    return 0 < int(port) <= 65535
 
 
 def validate_registered_uri(uri: str, extra: list[str]) -> str | None:

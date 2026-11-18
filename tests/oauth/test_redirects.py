@@ -24,6 +24,10 @@ def test_allowlist_accepts(uri):
 @pytest.mark.parametrize(
     "uri",
     [
+        "http://localhost",
+        "http://localhost/cb",
+        "http://localhost:5",
+        "http://127.0.0.1/cb",
         "http://[::1]:5/cb",
         "http://LOCALHOST:5/cb",
         "http://127.0.0.2:5/cb",
