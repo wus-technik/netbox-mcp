@@ -1121,3 +1121,83 @@ def test_config_model_rejects_max_session_days_below_one(oauth_config) -> None:
     data["max_session_days"] = 0
     with pytest.raises(ValidationError):
         type(oauth_config)(**data)
+
+
+# ------------------------------------------- write failures and restart (F9)
+
+
+async def test_renewal_swap_write_failure_keeps_previous_state(
+    http, store, fake_idp, fake_netbox_tokens, oauth_config, clock
+) -> None:
+    _, first = await tokens_for(http, fake_idp)
+    before = only_session(store)
+    clock.advance(5 * DAY + 60)  # the NetBox token is due for renewal
+    tokens_before = set(fake_netbox_tokens.tokens)
+    # Writes: 1 mark, 2 rotated IdP token, 3 renewal marker, 4 swap (fails).
+    with pytest.MonkeyPatch.context() as mp:
+        writes = spy_writes(store, mp, fail_at=4)
+        assert_error(
+            await refresh(http, first["refresh_token"]),
+            503,
+            "temporarily_unavailable",
+        )
+    assert len(writes) == 4
+    (created,) = set(fake_netbox_tokens.tokens) - tokens_before
+    store.close()
+    reopened = StateStore.open(oauth_config.state_path, oauth_config.state_key)
+    try:
+        state = reopened.snapshot()
+        session = only_session(reopened)
+        # Nothing of the failed swap or rotation is visible.
+        assert session.netbox_token == before.netbox_token
+        assert session.netbox_token_id == before.netbox_token_id
+        assert session.token_version == before.token_version
+        assert session.refresh_hash == before.refresh_hash
+        assert session.replay == before.replay
+        assert session.idp_refresh_started_at is None
+        assert state.cleanup == {}
+        # The renewal marker survived, so recovery removes the orphaned token.
+        (marker,) = state.pending.values()
+        assert marker.sid == session.sid
+        manager2 = await build_manager(
+            oauth_config, reopened, fake_idp, fake_netbox_tokens
+        )
+        clock.advance(601)
+        await manager2.recover_pending()
+        assert created not in fake_netbox_tokens.tokens
+        assert reopened.snapshot().pending == {}
+        # The previous refresh token still works.
+        async with app_client(oauth_config, manager2) as http2:
+            resp = await refresh(http2, first["refresh_token"])
+        assert resp.status_code == 200, resp.text
+        assert only_session(reopened).token_version == before.token_version + 1
+    finally:
+        reopened.close()
+
+
+async def test_code_redemption_write_failure_keeps_code_usable(
+    http, store, fake_idp, fake_netbox_tokens, oauth_config
+) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    before = only_session(store)
+    with pytest.MonkeyPatch.context() as mp:
+        spy_writes(store, mp, fail_at=1)
+        assert_error(
+            await exchange(http, client_id, code), 503, "temporarily_unavailable"
+        )
+    store.close()
+    reopened = StateStore.open(oauth_config.state_path, oauth_config.state_key)
+    try:
+        session = only_session(reopened)
+        assert session.code_hash == before.code_hash
+        assert session.code_redeemed is False
+        assert session.refresh_hash is None
+        manager2 = await build_manager(
+            oauth_config, reopened, fake_idp, fake_netbox_tokens
+        )
+        async with app_client(oauth_config, manager2) as http2:
+            resp = await exchange(http2, client_id, code)
+        assert resp.status_code == 200, resp.text
+        assert only_session(reopened).code_redeemed is True
+    finally:
+        reopened.close()
