@@ -113,12 +113,13 @@ async def test_denylisted_denied(
     assert not store.snapshot().links
 
 
-async def test_denylist_is_exact_match(
+async def test_denylist_is_case_insensitive(
     manager: SessionManager, oauth_config: OAuthConfig
 ) -> None:
     oauth_config.user_denylist = {"Alice"}
-    link = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
-    assert link.netbox_username == "alice"
+    with pytest.raises(LoginDenied) as exc:
+        await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
+    assert exc.value.reason_code == "denylisted"
 
 
 async def test_inactive_denied(manager: SessionManager) -> None:
@@ -161,15 +162,25 @@ async def test_username_change_in_netbox_follows_link_id(
     fake_netbox_tokens: FakeNetBoxTokens,
 ) -> None:
     first = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
-    # NetBox renames the account; the IdP claim has not caught up.
+    # NetBox renames the account and the IdP claim carries the new name.
     fake_netbox_tokens.users[first.netbox_user_id].username = "alice2"
-    link = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
+    link = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice2"))
     assert link.netbox_user_id == first.netbox_user_id
     assert link.netbox_username == "alice2"
     assert store.snapshot().links[link.user_key].netbox_username == "alice2"
-    # The claim now matches the renamed account: still the same user.
-    again = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice2"))
-    assert again.netbox_user_id == first.netbox_user_id
+
+
+async def test_unresolved_claim_for_linked_user_denied(
+    manager: SessionManager,
+    store: StateStore,
+    fake_netbox_tokens: FakeNetBoxTokens,
+) -> None:
+    first = await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
+    fake_netbox_tokens.users[first.netbox_user_id].username = "alice2"
+    with pytest.raises(LoginDenied) as exc:
+        await manager.resolve_identity(IDP_ISS, login("sub-a", "alice"))
+    assert exc.value.reason_code == "no_netbox_user"
+    assert store.snapshot().links[first.user_key] == first
 
 
 async def test_claim_resolving_to_other_user_denied(

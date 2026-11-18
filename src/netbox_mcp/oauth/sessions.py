@@ -95,7 +95,10 @@ class SessionManager:
         return LoginDenied(reason)
 
     def _check_eligible(self, user: NetBoxUser, user_key: str) -> None:
-        if user.username in self.config.user_denylist:
+        # Case-insensitive: the denylist is the only superuser guard when
+        # is_superuser is unknown, so over-denying is the safe direction.
+        denied = {name.casefold() for name in self.config.user_denylist}
+        if user.username.casefold() in denied:
             raise self._deny("denylisted", user_key)
         # is_superuser is None when the REST API does not expose it; the
         # mandatory denylist covers that case.
@@ -114,9 +117,9 @@ class SessionManager:
         """Map an IdP login to its NetBox user and return (recording) the link.
 
         An existing link is followed by NetBox user ID, so a renamed NetBox
-        account stays linked (the stored username is refreshed). The IdP
-        username claim must then resolve to the same user or to nothing; a
-        different user denies the login.
+        account stays linked (the stored username is refreshed), but the IdP
+        username claim must still resolve to that same user: no match denies
+        with ``no_netbox_user``, a different user with ``linked_elsewhere``.
 
         Raises:
             LoginDenied: With a reason code, if the identity is not eligible.
@@ -138,7 +141,9 @@ class SessionManager:
         if user is None:
             raise self._deny("no_netbox_user", user_key)
         claimed = await self._find(login.username, user_key)
-        if claimed is not None and claimed.id != link.netbox_user_id:
+        if claimed is None:
+            raise self._deny("no_netbox_user", user_key)
+        if claimed.id != link.netbox_user_id:
             raise self._deny("linked_elsewhere", user_key)
         self._check_eligible(user, user_key)
         if user.username == link.netbox_username:
