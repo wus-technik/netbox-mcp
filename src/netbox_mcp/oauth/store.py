@@ -13,6 +13,7 @@ import contextlib
 import errno
 import json
 import os
+import re
 import secrets
 import sys
 from collections.abc import AsyncIterator
@@ -142,13 +143,17 @@ _CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.ED
 
 
 def _remove_stale_tmp(path: Path) -> None:
-    """Best-effort removal of temp files left by an interrupted write."""
-    for stale in (
-        *path.parent.glob(f"{path.name}.*.tmp"),
-        path.with_name(path.name + ".tmp"),
-    ):
-        with contextlib.suppress(OSError):
-            stale.unlink()
+    """Best-effort removal of own temp files left by an interrupted write."""
+    pattern = re.compile(re.escape(path.name) + r"\.[0-9a-f]{16}\.tmp")
+    legacy = path.name + ".tmp"
+    try:
+        entries = list(path.parent.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.name == legacy or pattern.fullmatch(entry.name):
+            with contextlib.suppress(OSError):
+                entry.unlink()
 
 
 def _acquire_lock(path: Path) -> int:

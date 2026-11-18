@@ -493,7 +493,12 @@ async def test_leftover_hardlinked_tmp_cannot_corrupt_live_file(
 def test_open_removes_stale_tmp_files(tmp_path: Path) -> None:
     path = tmp_path / "state.bin"
     StateStore.create(path, KEY)
-    (tmp_path / "state.bin.abc123.tmp").write_bytes(b"x")
+    (tmp_path / "state.bin.0123456789abcdef.tmp").write_bytes(b"x")
     (tmp_path / "state.bin.tmp").write_bytes(b"x")
+    (tmp_path / "state.bin.backup.tmp").write_bytes(b"keep")
+    (tmp_path / "state.bin.abc123.tmp").write_bytes(b"keep")
     StateStore.open(path, KEY).close()
-    assert not list(tmp_path.glob("*.tmp"))
+    assert sorted(p.name for p in tmp_path.glob("*.tmp")) == [
+        "state.bin.abc123.tmp",
+        "state.bin.backup.tmp",
+    ]
