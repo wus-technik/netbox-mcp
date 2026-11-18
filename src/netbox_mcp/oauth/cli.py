@@ -19,10 +19,11 @@ import asyncio
 import base64
 import binascii
 import sys
-from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import TextIO
 from typing import TypeVar
 from urllib.parse import urlparse
@@ -119,7 +120,7 @@ def _end_sessions(state: OAuthState, sids: list[str], reason: str) -> int:
 
 
 def _run_locked(
-    settings: _StoreSettings, work: Callable[[StateStore], Awaitable[T]]
+    settings: _StoreSettings, work: Callable[[StateStore], Coroutine[Any, Any, T]]
 ) -> T:
     """Open the store (exclusive lock), run ``work``, always release the lock."""
     store = _open_store(settings)
