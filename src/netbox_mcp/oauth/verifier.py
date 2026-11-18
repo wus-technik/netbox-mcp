@@ -91,13 +91,20 @@ class OAuthTokenVerifier(TokenVerifier):
             or not session.code_redeemed
         ):
             return None
-        if manager.renewal_due(sid):
+        current = manager.current_token(sid)
+        if current is not None and manager.renewal_due(sid):
             try:
-                await manager.renew_if_due(sid)
+                ended = await manager.renew_if_due(sid)
             except StoreError:
                 # The current token is still valid; renewal is retried on use.
                 logger.warning("oauth: token renewal failed sid=%s", sid[:8])
-        current = manager.current_token(sid)
+                ended = False
+            if not ended:
+                current = manager.current_token(sid)
+            # Otherwise NetBox has just confirmed that this token is deleted or
+            # disabled and the session is ended. The call goes ahead with it,
+            # NetBox rejects it and the client gets the "reconnect" tool error
+            # of spec 6.3; the next request is answered 401.
         if current is None:
             return None
         bearer, version = current

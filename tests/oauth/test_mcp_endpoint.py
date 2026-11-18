@@ -447,6 +447,51 @@ async def test_renewal_failure_keeps_current_token(env, clock):
     assert request.headers["authorization"] == f"Bearer {old.netbox_token}"
 
 
+@pytest.mark.parametrize("change", ["delete", "disable"])
+async def test_token_gone_in_netbox_while_renewal_due_ends_session(env, clock, change):
+    e, _ = env
+    await login(e)
+    old = e.session()
+    clock.advance(5 * DAY + 60)  # renewal due
+    token, _ = AccessTokens(e.config).issue(old.sid, old.user_key, old.client_id)
+    getattr(e.netbox, f"{change}_token")(old.netbox_token_id)
+    created = len(e.netbox.sent("POST", "tokens.create"))
+
+    resp = await post(e.http, sites_call(), token)
+
+    # Spec 6.3: the call fails with "reconnect", no replacement token is made.
+    assert is_tool_error(resp)
+    assert "reconnect" in resp.json()["result"]["content"][0]["text"]
+    assert len(e.netbox.sent("POST", "tokens.create")) == created
+    state = e.manager.store.snapshot()
+    assert state.sessions == {}
+    assert state.pending == {}
+    (entry,) = state.cleanup.values()
+    assert entry.netbox_token_id == old.netbox_token_id
+
+    again = await post(e.http, sites_call(2), token)
+    assert again.status_code == 401
+    assert len(e.netbox.sent("POST", "tokens.create")) == created
+
+
+async def test_token_check_unavailable_while_renewal_due_keeps_token(env, clock):
+    e, _ = env
+    await login(e)
+    old = e.session()
+    clock.advance(5 * DAY + 60)
+    token, _ = AccessTokens(e.config).issue(old.sid, old.user_key, old.client_id)
+    e.netbox.fail("tokens.get", 503, times=1)
+    created = len(e.netbox.sent("POST", "tokens.create"))
+
+    resp = await post(e.http, sites_call(), token)
+
+    assert not is_tool_error(resp), resp.text
+    assert len(e.netbox.sent("POST", "tokens.create")) == created
+    assert e.session().token_version == old.token_version
+    (request,) = dcim_requests(e)
+    assert request.headers["authorization"] == f"Bearer {old.netbox_token}"
+
+
 async def test_unbound_verifier_rejects(oauth_config):
     verifier = OAuthTokenVerifier(oauth_config)
     token, _ = AccessTokens(oauth_config).issue("sid", "user", "client")

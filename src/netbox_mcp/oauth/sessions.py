@@ -371,15 +371,40 @@ class SessionManager:
             return None
         return session.netbox_token, session.token_version
 
-    async def renew_if_due(self, sid: str) -> None:
+    async def renew_if_due(self, sid: str) -> bool:
         """Replace the session's NetBox token if under 2 days remain.
 
-        Failures keep the current token (it is still valid) and are logged.
+        Before renewing, the current token is checked in NetBox (spec 6.3): a
+        token the user deleted or disabled ends the session instead of being
+        replaced. NetBox being unavailable keeps the current token without
+        renewing. Renewal failures keep the current token and are logged.
         Takes the session lock; use :meth:`renew_if_due_locked` when already
-        holding it.
+        holding it (it does not check the current token).
+
+        Returns:
+            True if the session was ended because NetBox no longer has its
+            token or the token is disabled.
         """
         async with self.lock_for(sid):
+            if not self.renewal_due(sid):
+                await self.renew_if_due_locked(sid)  # no-op or expiry warning
+                return False
+            session = self.store.snapshot().sessions[sid]
+            try:
+                info = await self.broker.get_token(session.netbox_token_id)
+            except BrokerError:
+                logger.warning(
+                    "oauth: renewal deferred, NetBox unavailable sid=%s", sid[:8]
+                )
+                return False
+            if info is None or not info.enabled:
+                reason = (
+                    "netbox_token_missing" if info is None else "netbox_token_disabled"
+                )
+                await self.end_session_locked(sid, reason)
+                return True
             await self.renew_if_due_locked(sid)
+            return False
 
     def renewal_due(self, sid: str) -> bool:
         """True if the session's NetBox token has less than 2 days left.
