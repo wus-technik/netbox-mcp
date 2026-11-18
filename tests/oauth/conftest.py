@@ -7,11 +7,12 @@ import pytest
 
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.store import StateStore
+from tests.oauth.fakes import ISSUER
 from tests.oauth.fakes import FakeIdP
 from tests.oauth.fakes import FakeNetBoxTokens
 
 OAUTH_ENV = {
-    "OIDC_ISSUER": "https://idp.example.com/realm",
+    "OIDC_ISSUER": ISSUER,
     "MCP_PUBLIC_URL": "https://mcp.example.com/mcp",
     "OIDC_CLIENT_ID": "netbox-mcp",
     "OIDC_CLIENT_SECRET": "client-secret",
@@ -26,7 +27,7 @@ OAUTH_ENV = {
 def oauth_config(tmp_path: Path) -> OAuthConfig:
     return OAuthConfig(
         public_url="https://mcp.example.com/mcp",
-        issuer_url="https://idp.example.com/realm",
+        issuer_url=ISSUER,
         client_id="netbox-mcp",
         client_secret="client-secret",
         allowed_groups=["netbox-users"],

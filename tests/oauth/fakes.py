@@ -22,6 +22,7 @@ import httpx2
 from joserfc import jwt
 from joserfc.jwk import RSAKey
 
+ISSUER = "https://idp.example.com/application/o/test/"
 HTML_LOGIN = "<html><body><form action='/login'>Sign in</form></body></html>"
 _RSA_KEY: RSAKey | None = None
 
@@ -79,7 +80,7 @@ class FakeIdP:
     outcome, times)`` queues one-shot outcomes ahead of it.
     """
 
-    issuer = "https://idp.example.com/application/o/test/"
+    issuer = ISSUER
     USERS: ClassVar[dict[str, dict[str, Any]]] = {
         "alice": {"sub": "sub-alice", "groups": ["netbox-users"]},
         "bob": {"sub": "sub-bob", "groups": []},
@@ -421,6 +422,8 @@ class FakeNetBoxTokens:
         self.service_token = service_token
         self.now = now
         self.page_size = 50
+        # Canned paths outside users/tokens that answer 200; everything else 404s.
+        self.other_paths = {"/api/status/", "/api/dcim/sites/", "/api/dcim/devices/"}
         self.invalid_token_status = 403
         self.users: dict[int, _User] = {}
         self.tokens: dict[int, dict[str, Any]] = {}
@@ -506,7 +509,9 @@ class FakeNetBoxTokens:
         ``mode``: ``"timeout"``, an HTTP status int (5xx, 429 with Retry-After,
         4xx), ``"html"`` (200 login page), ``"malformed"`` (200, broken JSON) or
         ``"commit_then_timeout"`` (create/delete takes effect, then the client
-        sees a timeout).
+        sees a timeout), or for ``tokens.create`` ``"token_missing"`` /
+        ``"token_null"`` (token is created and 201 returned, but the response
+        has no usable ``token`` secret).
         """
         self.failures.setdefault(endpoint, []).append(_Failure(mode, times))
 
@@ -582,7 +587,16 @@ class FakeNetBoxTokens:
         )
         self.requests.append(record)
         mode = self._take_failure(endpoint)
-        if mode is not None and mode != "commit_then_timeout":
+        if mode in ("token_missing", "token_null"):
+            response = self._serve(request, record, endpoint, pk, body)
+            if response.status_code == 201:
+                data = response.json()
+                if mode == "token_null":
+                    data["token"] = None
+                else:
+                    data.pop("token")
+                response = httpx2.Response(201, json=data)
+        elif mode is not None and mode != "commit_then_timeout":
             response = self._failing(mode, request)
         else:
             response = self._serve(request, record, endpoint, pk, body)
@@ -624,6 +638,8 @@ class FakeNetBoxTokens:
             )
             return httpx2.Response(status, json={"detail": detail})
         if endpoint == "other":
+            if request.url.path not in self.other_paths:
+                return httpx2.Response(404, json={"detail": "Not found."})
             return httpx2.Response(200, json={"count": 0, "next": None, "results": []})
         params = dict(request.url.params.multi_items())
         if endpoint == "users.list":

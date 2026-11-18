@@ -279,3 +279,33 @@ def test_netbox_expired_and_disabled_tokens_rejected(
     nb.tokens[record["id"]]["expires"] = None
     nb.disable_token(record["id"])
     assert http.get(f"{NB}/api/status/", headers=auth).status_code == 403
+
+
+def test_discovery_matches_oauth_config_issuer(fake_idp: FakeIdP, oauth_config):
+    http = _client(fake_idp.transport)
+    url = f"{oauth_config.issuer_url}.well-known/openid-configuration"
+    assert http.get(url).json()["issuer"] == oauth_config.issuer_url
+
+
+def test_netbox_unknown_path_is_404(fake_netbox_tokens: FakeNetBoxTokens):
+    nb = fake_netbox_tokens
+    http = _client(nb.transport)
+    auth = {"Authorization": f"Bearer {nb.service_token}"}
+    resp = http.get(f"{NB}/api/nope/", headers=auth)
+    assert resp.status_code == 404
+    assert resp.json() == {"detail": "Not found."}
+
+
+@pytest.mark.parametrize("mode", ["token_missing", "token_null"])
+def test_netbox_create_without_secret(fake_netbox_tokens: FakeNetBoxTokens, mode):
+    nb = fake_netbox_tokens
+    http = _client(nb.transport)
+    nb.fail("tokens.create", mode, times=1)
+    resp = http.post(
+        f"{NB}/api/users/tokens/",
+        json={"user": 1, "description": "d"},
+        headers={"Authorization": f"Bearer {nb.service_token}"},
+    )
+    assert resp.status_code == 201
+    assert not resp.json().get("token")
+    assert len(nb.tokens) == 1
