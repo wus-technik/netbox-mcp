@@ -268,10 +268,10 @@ class NetBoxBroker:
             if 400 <= exc.status < 500:
                 raise BrokerDefinite(
                     f"NetBox refused the token create with HTTP {exc.status}"
-                ) from exc
+                ) from None
             raise BrokerAmbiguous(
                 f"NetBox answered the token create with HTTP {exc.status}"
-            ) from exc
+            ) from None
         except ValueError as exc:
             # A redirect turned the POST into a GET: nothing was created.
             raise BrokerDefinite(

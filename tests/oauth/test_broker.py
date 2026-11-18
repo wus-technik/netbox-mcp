@@ -261,3 +261,19 @@ async def test_find_user_ignores_inexact_username_rows() -> None:
     assert user is not None
     assert user.id == 2
     assert await broker.find_user("bob") is None
+
+
+@pytest.mark.parametrize(
+    ("status", "error"), [(400, BrokerDefinite), (500, BrokerAmbiguous)]
+)
+async def test_create_errors_drop_response_body(status: int, error: type) -> None:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status, json={"detail": "SECRET-BODY-TEXT"})
+
+    config = NetBoxConfig(netbox_url="https://netbox.example.com")
+    broker = NetBoxBroker(config, SERVICE, transport=httpx2.MockTransport(handler))
+    with pytest.raises(error) as info:
+        await broker.create_token(1, "d", time.time() + 100)
+    assert info.value.__cause__ is None
+    assert info.value.__suppress_context__
+    assert "SECRET-BODY-TEXT" not in str(info.value)
