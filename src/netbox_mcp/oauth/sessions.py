@@ -7,20 +7,34 @@ to this class; this first part maps IdP identities to NetBox users.
 
 import asyncio
 import logging
+import uuid
 import weakref
 
 from netbox_mcp.oauth import tokens as token_time
+from netbox_mcp.oauth.broker import BrokerAmbiguous
 from netbox_mcp.oauth.broker import BrokerConflict
+from netbox_mcp.oauth.broker import BrokerDefinite
 from netbox_mcp.oauth.broker import NetBoxBroker
 from netbox_mcp.oauth.broker import NetBoxUser
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.idp import IdpClient
 from netbox_mcp.oauth.idp import IdpLogin
+from netbox_mcp.oauth.state import CleanupEntry
+from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.state import Link
+from netbox_mcp.oauth.state import OAuthState
+from netbox_mcp.oauth.state import PendingCreate
+from netbox_mcp.oauth.state import Session
 from netbox_mcp.oauth.store import StateStore
+from netbox_mcp.oauth.store import StoreWriteError
 from netbox_mcp.oauth.tokens import AccessTokens
 
 logger = logging.getLogger(__name__)
+
+NETBOX_TOKEN_TTL = 7 * 86400
+RENEW_BELOW = 2 * 86400
+CODE_TTL = 300
+REFRESH_TTL = 30 * 86400
 
 _NO_USER_MESSAGE = (
     "No active NetBox account matches your identity. "
@@ -47,6 +61,10 @@ class LoginDenied(Exception):  # noqa: N818 - name fixed by the interface
         super().__init__(self.message)
 
 
+class LoginFailed(Exception):  # noqa: N818 - name fixed by the interface
+    """The session could not be created (NetBox token creation failed)."""
+
+
 class SessionManager:
     def __init__(
         self,
@@ -68,6 +86,8 @@ class SessionManager:
         self._user_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # Set whenever a cleanup entry is enqueued; the background job waits on it.
+        self.cleanup_wanted = asyncio.Event()
 
     # ------------------------------------------------------------------ locks
 
@@ -177,3 +197,161 @@ class SessionManager:
             state.links[user_key] = link
         logger.info("oauth link created: user_key=%s", user_key)
         return link
+
+    # -------------------------------------------------------- session lifecycle
+
+    @staticmethod
+    def _description(client_name: str, sid: str, nonce: str) -> str:
+        return f"NetBox MCP (OAuth) {client_name} {sid[:8]} {nonce}"
+
+    @staticmethod
+    def _enqueue(state: OAuthState, token_id: int, user_id: int, reason: str) -> None:
+        entry_id = uuid.uuid4().hex
+        state.cleanup[entry_id] = CleanupEntry(
+            entry_id=entry_id,
+            netbox_token_id=token_id,
+            netbox_user_id=user_id,
+            reason=reason,
+            created_at=token_time.now(),
+        )
+
+    async def _drop_marker(self, nonce: str) -> None:
+        """Best effort: a marker left behind is cleaned up by recovery."""
+        try:
+            async with self.store.mutate() as state:
+                state.pending.pop(nonce, None)
+        except StoreWriteError:
+            logger.warning("oauth: could not drop pending marker %s", nonce[:4])
+
+    async def create_session(
+        self, link: Link, client: Client, idp_refresh_token: str
+    ) -> tuple[Session, str]:
+        """Create a session with its own NetBox token; return it and the code.
+
+        Raises:
+            LoginFailed: The token create outcome is unknown or refused.
+            StoreWriteError: A store write failed. If it was the final one the
+                marker is still on disk and recovery deletes any created token.
+        """
+        sid = uuid.uuid4().hex
+        nonce = uuid.uuid4().hex
+        now = token_time.now()
+        async with self.store.mutate() as state:
+            state.pending[nonce] = PendingCreate(
+                nonce=nonce, netbox_user_id=link.netbox_user_id, sid=sid, created_at=now
+            )
+        try:
+            created = await self.broker.create_token(
+                link.netbox_user_id,
+                self._description(client.client_name, sid, nonce),
+                now + NETBOX_TOKEN_TTL,
+            )
+        except BrokerAmbiguous:
+            logger.warning("oauth: token create outcome unknown sid=%s", sid[:8])
+            raise LoginFailed("NetBox token creation failed") from None
+        except BrokerDefinite:
+            await self._drop_marker(nonce)
+            logger.warning("oauth: token create refused sid=%s", sid[:8])
+            raise LoginFailed("NetBox refused to create a token") from None
+        code = token_time.new_secret()
+        session = Session(
+            sid=sid,
+            user_key=link.user_key,
+            client_id=client.client_id,
+            netbox_user_id=link.netbox_user_id,
+            created_at=now,
+            code_hash=token_time.hash_secret(code),
+            code_expires_at=now + CODE_TTL,
+            refresh_deadline=now + REFRESH_TTL,
+            idp_refresh_token=idp_refresh_token,
+            last_idp_check_at=now,
+            netbox_token=created.bearer,
+            netbox_token_id=created.token_id,
+            netbox_token_expires_at=created.expires_at,
+            token_version=1,
+        )
+        async with self.store.mutate() as state:
+            state.sessions[sid] = session
+            state.pending.pop(nonce, None)
+        logger.info("oauth session created sid=%s", sid[:8])
+        return session.model_copy(deep=True), code
+
+    def current_token(self, sid: str) -> tuple[str, int] | None:
+        """Return ``(bearer, token_version)`` of the session, if it exists."""
+        session = self.store.snapshot().sessions.get(sid)
+        if session is None:
+            return None
+        return session.netbox_token, session.token_version
+
+    async def renew_if_due(self, sid: str) -> None:
+        """Replace the session's NetBox token if under 2 days remain.
+
+        Failures keep the current token (it is still valid) and are logged.
+        """
+        async with self.lock_for(sid):
+            snap = self.store.snapshot()
+            session = snap.sessions.get(sid)
+            if session is None or session.netbox_token_expires_at is None:
+                return
+            now = token_time.now()
+            if session.netbox_token_expires_at - now >= RENEW_BELOW:
+                return
+            client = snap.clients.get(session.client_id)
+            name = client.client_name if client else session.client_id
+            nonce = uuid.uuid4().hex
+            async with self.store.mutate() as state:
+                state.pending[nonce] = PendingCreate(
+                    nonce=nonce,
+                    netbox_user_id=session.netbox_user_id,
+                    sid=sid,
+                    created_at=now,
+                )
+            try:
+                created = await self.broker.create_token(
+                    session.netbox_user_id,
+                    self._description(name, sid, nonce),
+                    now + NETBOX_TOKEN_TTL,
+                )
+            except BrokerDefinite:
+                await self._drop_marker(nonce)
+                logger.warning("oauth: renewal refused sid=%s", sid[:8])
+                return
+            except Exception:  # ambiguous or unavailable: keep marker and token
+                logger.warning("oauth: renewal failed sid=%s", sid[:8], exc_info=True)
+                return
+            async with self.store.mutate() as state:
+                state.pending.pop(nonce, None)
+                stored = state.sessions.get(sid)
+                if stored is None:
+                    self._enqueue(
+                        state, created.token_id, session.netbox_user_id, "orphaned"
+                    )
+                else:
+                    self._enqueue(
+                        state, stored.netbox_token_id, stored.netbox_user_id, "renewed"
+                    )
+                    stored.netbox_token = created.bearer
+                    stored.netbox_token_id = created.token_id
+                    stored.netbox_token_expires_at = created.expires_at
+                    stored.token_version += 1
+            self.cleanup_wanted.set()
+
+    async def end_session(self, sid: str, reason: str) -> None:
+        """End a session and enqueue its NetBox token. Idempotent.
+
+        Takes the session lock; use :meth:`end_session_locked` when already
+        holding it.
+        """
+        async with self.lock_for(sid):
+            await self.end_session_locked(sid, reason)
+
+    async def end_session_locked(self, sid: str, reason: str) -> None:
+        async with self.store.mutate() as state:
+            session = state.sessions.pop(sid, None)
+            if session is None:
+                return
+            self._enqueue(
+                state, session.netbox_token_id, session.netbox_user_id, reason
+            )
+        logger.info("oauth session ended sid=%s reason=%s", sid[:8], reason)
+        self.cleanup_wanted.set()
