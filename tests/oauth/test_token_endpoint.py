@@ -1029,3 +1029,47 @@ async def test_max_session_age_boundaries(
     assert store.snapshot().sessions == {}
     assert len(store.snapshot().cleanup) >= 1
     assert "reason=max_age" in caplog.text
+
+
+# ------------------------------------------------------------ fix round 3
+
+
+@pytest.mark.parametrize("malformed", [True, False])
+async def test_spent_refresh_token_sent_as_code_keeps_reuse_detection(
+    http, store, fake_idp, manager, malformed
+) -> None:
+    client_id, a = await tokens_for(http, fake_idp)
+    b = (await refresh(http, a["refresh_token"])).json()
+    await refresh(http, b["refresh_token"])  # a is now an older spent token
+    spent = a["refresh_token"]
+    if malformed:
+        resp = await http.post(
+            TOKEN, data={"grant_type": "authorization_code", "code": spent}
+        )
+        assert_error(resp, 400, "invalid_request")
+    else:
+        assert_error(await exchange(http, client_id, spent), 400, "invalid_grant")
+    assert manager._lookup(hash_secret(spent)) is not None
+    assert_error(await refresh(http, spent), 400, "invalid_grant")
+    assert store.snapshot().sessions == {}  # reuse still ends the session
+
+
+async def test_code_sent_to_refresh_and_revoke_still_redeems(
+    http, store, fake_idp, manager
+) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    assert_error(await refresh(http, code), 400, "invalid_grant")
+    assert (await http.post(REVOKE, data={"token": code})).status_code == 200
+    assert manager._lookup(hash_secret(code)) is not None
+    assert len(store.snapshot().sessions) == 1
+    resp = await exchange(http, client_id, code)
+    assert resp.status_code == 200, resp.text
+
+
+def test_config_model_rejects_max_session_days_below_one(oauth_config) -> None:
+    from pydantic import ValidationError
+
+    data = oauth_config.model_dump()
+    data["max_session_days"] = 0
+    with pytest.raises(ValidationError):
+        type(oauth_config)(**data)

@@ -45,7 +45,7 @@ class OAuthConfig(BaseModel):
     user_denylist: set[str] = set()
     auth_debug: bool = False
     # Absolute session lifetime; afterwards a new login is needed.
-    max_session_days: int = DEFAULT_MAX_SESSION_DAYS
+    max_session_days: int = Field(default=DEFAULT_MAX_SESSION_DAYS, ge=1)
 
     @property
     def base_path(self) -> str:

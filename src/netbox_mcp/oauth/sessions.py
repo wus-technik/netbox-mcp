@@ -490,6 +490,13 @@ class SessionManager:
             for value in values:
                 self._hash_index.pop(value, None)
 
+    def _drop_if_stale(self, session: Session | None, value: str) -> None:
+        """Drop an index entry only if the session no longer holds the hash in
+        any role. Code and refresh hashes share the index: a lookup of the
+        wrong type must not erase, e.g., a spent hash (reuse detection)."""
+        if session is None or value not in self._session_hashes(session):
+            self._index_drop(value)
+
     def _lookup(self, value: str) -> str | None:
         """Session ID for a hash, or None. Verify under the session lock."""
         return self._index().get(value)
@@ -537,7 +544,7 @@ class SessionManager:
         async with self.lock_for(sid):
             current = self.store.snapshot().sessions.get(sid)
             if current is None or current.code_hash != code_hash:
-                self._index_drop(code_hash)
+                self._drop_if_stale(current, code_hash)
                 return
             async with self.store.mutate() as state:
                 stored = state.sessions.get(sid)
@@ -584,7 +591,7 @@ class SessionManager:
         async with self.lock_for(sid):
             session = self.store.snapshot().sessions.get(sid)
             if session is None or session.code_hash != code_hash:
-                self._index_drop(code_hash)
+                self._drop_if_stale(session, code_hash)
                 raise GrantError("invalid_grant", "unknown, used or expired code")
             now = token_time.now()
             problem: GrantError | None = None
@@ -685,8 +692,9 @@ class SessionManager:
         snap = self.store.snapshot()
         session = snap.sessions.get(sid)
         if session is None or not self._holds_refresh(session, token_hash):
-            # Stale index entry: the token is unknown.
-            self._index_drop(token_hash)
+            # Not a refresh token of this session: unknown. The entry is kept
+            # if the hash is still the session's (e.g. its code).
+            self._drop_if_stale(session, token_hash)
             raise self._refresh_rejected(sid, "unknown_token")
         if session.idp_refresh_started_at is not None:
             # A previous IdP refresh has an unknown outcome (crash before its
@@ -846,7 +854,7 @@ class SessionManager:
             if token_hash is not None and (
                 session is None or not self._holds_refresh(session, token_hash)
             ):
-                self._index_drop(token_hash)
+                self._drop_if_stale(session, token_hash)
                 return
             if session is None:
                 return
