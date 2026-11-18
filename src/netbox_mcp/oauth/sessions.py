@@ -14,6 +14,7 @@ from netbox_mcp.oauth import tokens as token_time
 from netbox_mcp.oauth.broker import BrokerAmbiguous
 from netbox_mcp.oauth.broker import BrokerConflict
 from netbox_mcp.oauth.broker import BrokerDefinite
+from netbox_mcp.oauth.broker import BrokerUnavailable
 from netbox_mcp.oauth.broker import NetBoxBroker
 from netbox_mcp.oauth.broker import NetBoxUser
 from netbox_mcp.oauth.config import OAuthConfig
@@ -35,6 +36,7 @@ NETBOX_TOKEN_TTL = 7 * 86400
 RENEW_BELOW = 2 * 86400
 CODE_TTL = 300
 REFRESH_TTL = 30 * 86400
+DESCRIPTION_MAX = 200
 
 _NO_USER_MESSAGE = (
     "No active NetBox account matches your identity. "
@@ -202,7 +204,15 @@ class SessionManager:
 
     @staticmethod
     def _description(client_name: str, sid: str, nonce: str) -> str:
-        return f"NetBox MCP (OAuth) {client_name} {sid[:8]} {nonce}"
+        prefix = "NetBox MCP (OAuth) "
+        tail = f" {sid[:8]} {nonce}"
+        # client_name is attacker-chosen (dynamic registration): flatten
+        # whitespace and control characters, and fit NetBox's 200 char limit.
+        clean = " ".join(
+            "".join(" " if not c.isprintable() else c for c in client_name).split()
+        )
+        room = max(DESCRIPTION_MAX - len(prefix) - len(tail), 0)
+        return f"{prefix}{clean[:room].rstrip()}{tail}"
 
     @staticmethod
     def _enqueue(state: OAuthState, token_id: int, user_id: int, reason: str) -> None:
@@ -221,7 +231,7 @@ class SessionManager:
             async with self.store.mutate() as state:
                 state.pending.pop(nonce, None)
         except StoreWriteError:
-            logger.warning("oauth: could not drop pending marker %s", nonce[:4])
+            logger.warning("oauth: could not drop pending marker")
 
     async def create_session(
         self, link: Link, client: Client, idp_refresh_token: str
@@ -253,6 +263,7 @@ class SessionManager:
             await self._drop_marker(nonce)
             logger.warning("oauth: token create refused sid=%s", sid[:8])
             raise LoginFailed("NetBox refused to create a token") from None
+        now = token_time.now()  # after the POST, which may have taken a while
         code = token_time.new_secret()
         session = Session(
             sid=sid,
@@ -291,7 +302,10 @@ class SessionManager:
         async with self.lock_for(sid):
             snap = self.store.snapshot()
             session = snap.sessions.get(sid)
-            if session is None or session.netbox_token_expires_at is None:
+            if session is None:
+                return
+            if session.netbox_token_expires_at is None:
+                logger.warning("oauth: session %s has no token expiry", sid[:8])
                 return
             now = token_time.now()
             if session.netbox_token_expires_at - now >= RENEW_BELOW:
@@ -316,8 +330,9 @@ class SessionManager:
                 await self._drop_marker(nonce)
                 logger.warning("oauth: renewal refused sid=%s", sid[:8])
                 return
-            except Exception:  # ambiguous or unavailable: keep marker and token
-                logger.warning("oauth: renewal failed sid=%s", sid[:8], exc_info=True)
+            except (BrokerAmbiguous, BrokerUnavailable):
+                # Keep marker and current token; recovery handles the marker.
+                logger.warning("oauth: renewal failed sid=%s", sid[:8])
                 return
             async with self.store.mutate() as state:
                 state.pending.pop(nonce, None)

@@ -13,6 +13,7 @@ from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.state import Link
 from netbox_mcp.oauth.store import StateStore
 from netbox_mcp.oauth.store import StoreWriteError
+from netbox_mcp.oauth.store import _decrypt
 from netbox_mcp.oauth.tokens import AccessTokens
 from tests.oauth.fakes import FakeNetBoxTokens
 
@@ -75,13 +76,18 @@ async def test_create_session_marker_removed_in_same_write(
     original = store._write_file
 
     def spy(data: bytes) -> None:
-        writes.append(len(posts(fake_netbox_tokens)))
+        writes.append((len(posts(fake_netbox_tokens)), _decrypt(data, store._key)))
         original(data)
 
     monkeypatch.setattr(store, "_write_file", spy)
     session, code = await manager.create_session(link, client, "idp-rt")
     # Write 1 (marker) is before the POST, write 2 (session, no marker) after it.
-    assert writes == [0, 1]
+    assert [w[0] for w in writes] == [0, 1]
+    assert len(writes[0][1].pending) == 1
+    assert writes[0][1].sessions == {}
+    after_post = writes[1][1]
+    assert session.sid in after_post.sessions
+    assert after_post.pending == {}
     state = store.snapshot()
     assert session.sid in state.sessions
     assert state.pending == {}
@@ -251,3 +257,53 @@ async def test_end_session_idempotent(manager, store, link, client) -> None:
     await manager.end_session(session.sid, "revoked")
     assert len(store.snapshot().cleanup) == 1
     assert manager.current_token(session.sid) is None
+
+
+async def test_description_long_client_name_truncated(
+    manager, fake_netbox_tokens, link, client
+) -> None:
+    client.client_name = "x" * 500
+    session = await _make(manager, link, client)
+    desc = fake_netbox_tokens.tokens[session.netbox_token_id]["description"]
+    assert len(desc) <= 200
+    assert desc.startswith("NetBox MCP (OAuth) xxx")
+    parts = desc.split(" ")
+    assert parts[-2] == session.sid[:8]
+    assert len(parts[-1]) == 32
+
+
+async def test_description_control_chars_flattened(
+    manager, fake_netbox_tokens, link, client
+) -> None:
+    client.client_name = "evil\n\r\tname\x00  with\u2028gaps"
+    session = await _make(manager, link, client)
+    desc = fake_netbox_tokens.tokens[session.netbox_token_id]["description"]
+    assert desc.startswith("NetBox MCP (OAuth) evil name with gaps ")
+    assert all(c.isprintable() for c in desc)
+
+
+async def test_create_session_times_taken_after_post(
+    manager, link, client, clock, monkeypatch
+) -> None:
+    original = manager.broker.create_token
+
+    async def slow(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        clock.advance(120)
+        return result
+
+    monkeypatch.setattr(manager.broker, "create_token", slow)
+    start = clock()
+    session, _ = await manager.create_session(link, client, "rt")
+    assert session.code_expires_at == start + 120 + 300
+    assert session.refresh_deadline == start + 120 + 30 * DAY
+    assert session.last_idp_check_at == start + 120
+
+
+async def test_renew_without_expiry_warns(manager, store, link, client, caplog) -> None:
+    session = await _make(manager, link, client)
+    async with store.mutate() as state:
+        state.sessions[session.sid].netbox_token_expires_at = None
+    with caplog.at_level("WARNING"):
+        await manager.renew_if_due(session.sid)
+    assert "no token expiry" in caplog.text
