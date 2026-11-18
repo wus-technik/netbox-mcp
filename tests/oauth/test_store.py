@@ -460,3 +460,40 @@ def test_create_survives_tmp_cleanup_failure(
     StateStore.create(path, KEY)
     monkeypatch.undo()
     StateStore.open(path, KEY).close()
+
+
+@pytest.mark.asyncio
+async def test_leftover_hardlinked_tmp_cannot_corrupt_live_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    stale = tmp_path / "state.bin.tmp"
+    os.link(path, stale)  # leftover tmp sharing the live inode
+    s = StateStore.open(path, KEY)  # open removes it (best effort)
+    try:
+        assert not stale.exists()
+        os.link(path, stale)  # simulate a leftover appearing again
+
+        def boom(*_a: object, **_k: object) -> None:
+            raise OSError("crash")
+
+        monkeypatch.setattr(os, "replace", boom)
+        monkeypatch.setattr(Path, "replace", boom)
+        with pytest.raises(StoreWriteError):
+            async with s.mutate() as state:
+                state.clients["c1"] = _client()
+        monkeypatch.undo()
+    finally:
+        s.close()
+    # the live file is still intact and decryptable
+    StateStore.open(path, KEY).close()
+
+
+def test_open_removes_stale_tmp_files(tmp_path: Path) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    (tmp_path / "state.bin.abc123.tmp").write_bytes(b"x")
+    (tmp_path / "state.bin.tmp").write_bytes(b"x")
+    StateStore.open(path, KEY).close()
+    assert not list(tmp_path.glob("*.tmp"))

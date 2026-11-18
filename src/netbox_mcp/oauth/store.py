@@ -115,9 +115,9 @@ def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
     (``FileExistsError``). Raises ``_CommitUncertainError`` if the file is in
     place but the directory fsync failed.
     """
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
     try:
-        with tmp.open("wb") as f:
+        with tmp.open("xb") as f:  # exclusive: never reuse a leftover inode
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -139,6 +139,16 @@ def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
 
 
 _CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK})
+
+
+def _remove_stale_tmp(path: Path) -> None:
+    """Best-effort removal of temp files left by an interrupted write."""
+    for stale in (
+        *path.parent.glob(f"{path.name}.*.tmp"),
+        path.with_name(path.name + ".tmp"),
+    ):
+        with contextlib.suppress(OSError):
+            stale.unlink()
 
 
 def _acquire_lock(path: Path) -> int:
@@ -214,6 +224,7 @@ class StateStore:
             except OSError as exc:
                 raise StoreError(f"cannot read state file: {exc.strerror}") from None
             state = _decrypt(data, key)
+            _remove_stale_tmp(path)
         except BaseException:
             _release_lock(lock_fd)
             raise
