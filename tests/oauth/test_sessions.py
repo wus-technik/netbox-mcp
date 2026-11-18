@@ -18,6 +18,11 @@ from netbox_mcp.oauth.tokens import AccessTokens
 from tests.oauth.fakes import FakeNetBoxTokens
 
 DAY = 86400
+BINDING = {
+    "redirect_uri": "http://localhost/cb",
+    "code_challenge": "c" * 43,
+    "resource": None,
+}
 
 
 @pytest.fixture
@@ -65,7 +70,7 @@ def posts(fake: FakeNetBoxTokens) -> list:
 
 
 async def _make(manager, link, client):
-    session, _ = await manager.create_session(link, client, "rt")
+    session, _ = await manager.create_session(link, client, "rt", **BINDING)
     return session
 
 
@@ -80,7 +85,7 @@ async def test_create_session_marker_removed_in_same_write(
         original(data)
 
     monkeypatch.setattr(store, "_write_file", spy)
-    session, code = await manager.create_session(link, client, "idp-rt")
+    session, code = await manager.create_session(link, client, "idp-rt", **BINDING)
     # Write 1 (marker) is before the POST, write 2 (session, no marker) after it.
     assert [w[0] for w in writes] == [0, 1]
     assert len(writes[0][1].pending) == 1
@@ -88,6 +93,11 @@ async def test_create_session_marker_removed_in_same_write(
     after_post = writes[1][1]
     assert session.sid in after_post.sessions
     assert after_post.pending == {}
+    written = after_post.sessions[session.sid]
+    assert written.code_hash is not None
+    assert written.code_redirect_uri == BINDING["redirect_uri"]
+    assert written.code_challenge == BINDING["code_challenge"]
+    assert written.code_resource is None
     state = store.snapshot()
     assert session.sid in state.sessions
     assert state.pending == {}
@@ -105,7 +115,7 @@ async def test_create_token_ambiguous_keeps_marker(
 ) -> None:
     fake_netbox_tokens.fail("tokens.create", "commit_then_timeout")
     with pytest.raises(LoginFailed):
-        await manager.create_session(link, client, "rt")
+        await manager.create_session(link, client, "rt", **BINDING)
     state = store.snapshot()
     assert len(state.pending) == 1
     assert state.sessions == {}
@@ -117,7 +127,7 @@ async def test_create_token_definite_drops_marker(
 ) -> None:
     fake_netbox_tokens.fail("tokens.create", 403)
     with pytest.raises(LoginFailed):
-        await manager.create_session(link, client, "rt")
+        await manager.create_session(link, client, "rt", **BINDING)
     state = store.snapshot()
     assert state.pending == {}
     assert state.sessions == {}
@@ -138,7 +148,7 @@ async def test_create_final_write_failure_leaves_marker(
 
     monkeypatch.setattr(store, "_write_file", flaky)
     with pytest.raises(StoreWriteError):
-        await manager.create_session(link, client, "rt")
+        await manager.create_session(link, client, "rt", **BINDING)
     state = store.snapshot()
     assert len(state.pending) == 1
     assert state.sessions == {}
@@ -294,7 +304,7 @@ async def test_create_session_times_taken_after_post(
 
     monkeypatch.setattr(manager.broker, "create_token", slow)
     start = clock()
-    session, _ = await manager.create_session(link, client, "rt")
+    session, _ = await manager.create_session(link, client, "rt", **BINDING)
     assert session.code_expires_at == start + 120 + 300
     assert session.refresh_deadline == start + 120 + 30 * DAY
     assert session.last_idp_check_at == start + 120

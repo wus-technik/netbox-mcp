@@ -83,6 +83,10 @@ class Session(_Model):
     code_hash: str | None = None
     code_expires_at: float | None = None
     code_redeemed: bool = False
+    # Bindings of the authorization code (spec 5.4), checked at redemption.
+    code_redirect_uri: str | None = None
+    code_challenge: str | None = None
+    code_resource: str | None = None
     refresh_hash: str | None = None
     spent_hashes: list[str] = Field(default_factory=list)
     replay: Replay | None = None

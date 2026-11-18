@@ -21,6 +21,7 @@ from netbox_mcp.oauth.routes import oauth_routes
 from netbox_mcp.oauth.sessions import SessionManager
 from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.store import StateStore
+from netbox_mcp.oauth.store import _CommitUncertainError
 from netbox_mcp.oauth.store import _decrypt
 from netbox_mcp.oauth.tokens import AccessTokens
 from netbox_mcp.oauth.tokens import hash_secret
@@ -811,3 +812,95 @@ async def test_no_secrets_in_logs(http, store, fake_idp, caplog) -> None:
     for secret in secrets:
         assert secret not in text
     assert "?" not in text
+
+
+# ------------------------------------------------- fix round 1 (review)
+
+
+async def test_session_carries_code_bindings(http, store, fake_idp) -> None:
+    uri = "http://localhost:8080/cb"
+    client_id = await register(http, uris=[uri])
+    # Loopback: the requested port may differ from the registered one.
+    requested = "http://localhost:9999/cb"
+    cb = await http.get(
+        await callback_url(
+            http, fake_idp, client_id, redirect_uri=requested, resource=PUBLIC + "/"
+        )
+    )
+    final = await approve(http, cb.headers["location"])
+    assert final.status_code == 303
+    (session,) = store.snapshot().sessions.values()
+    assert session.code_redirect_uri == requested
+    assert session.code_challenge == CHALLENGE
+    assert session.code_resource == PUBLIC + "/"
+
+
+async def test_session_without_resource_has_none(http, store, fake_idp) -> None:
+    client_id = await register(http)
+    await login_with_consent(http, fake_idp, client_id)
+    (session,) = store.snapshot().sessions.values()
+    assert session.code_redirect_uri == REDIRECT
+    assert session.code_resource is None
+
+
+@pytest.mark.parametrize("endpoint", ["register", "authorize", "callback", "consent"])
+async def test_failed_store_answers_503(
+    http, store, fake_idp, monkeypatch, endpoint
+) -> None:
+    client_id = await register(http)
+    url = await callback_url(http, fake_idp, client_id)
+
+    def uncertain(_data: bytes) -> None:
+        raise _CommitUncertainError
+
+    monkeypatch.setattr(store, "_write_file", uncertain)
+    # Any write now leaves the store failed; snapshot() raises StoreError.
+    resp = await http.post("/register", json={"redirect_uris": [REDIRECT]})
+    assert resp.status_code == 503
+    if endpoint == "register":
+        resp = await http.post("/register", json={"redirect_uris": [REDIRECT]})
+        assert resp.json()["error"] == "temporarily_unavailable"
+    elif endpoint == "authorize":
+        resp = await authorize(http, client_id)
+    elif endpoint == "callback":
+        resp = await http.get(url)
+    else:
+        resp = await http.get("/mcp/oauth/consent")
+    assert resp.status_code == 503
+    if endpoint != "register":
+        assert resp.headers["content-type"].startswith("text/html")
+        assert resp.headers["x-frame-options"] == "DENY"
+
+
+async def test_consent_grant_not_written_without_link(
+    http, store, fake_idp, fake_netbox_tokens
+) -> None:
+    client_id = await register(http)
+    cb = await http.get(await callback_url(http, fake_idp, client_id))
+    _page, csrf = await consent_form(http, cb.headers["location"])
+    async with store.mutate() as state:
+        state.links.clear()  # e.g. relinked or removed meanwhile
+    resp = await http.post(
+        "/mcp/oauth/consent", data={"csrf": csrf, "decision": "approve"}
+    )
+    assert resp.status_code == 400
+    snap = store.snapshot()
+    assert snap.grants == {}
+    assert snap.sessions == {}
+    assert snap.flows == {}
+    assert created_tokens(fake_netbox_tokens) == 0
+
+
+def test_rate_limiter_key_count_is_bounded(monkeypatch, clock) -> None:
+    monkeypatch.setattr(routes, "_RATE_KEYS_MAX", 3)
+    limiter = routes._RateLimiter(limit=10, window=60)
+    assert all(limiter.allow(ip) for ip in ("a", "b", "c"))
+    assert limiter.allow("d") is False  # full of active keys: new callers wait
+    assert len(limiter._hits) == 3
+    assert limiter.allow("a") is True  # known keys keep their own budget
+    clock.advance(61)
+    assert limiter.allow("d") is True  # expired keys are pruned
+    assert len(limiter._hits) == 1
+    for i in range(100):
+        limiter.allow(f"x{i}")
+    assert len(limiter._hits) <= 3

@@ -57,6 +57,7 @@ from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.state import Flow
 from netbox_mcp.oauth.state import Grant
 from netbox_mcp.oauth.state import Link
+from netbox_mcp.oauth.store import StoreError
 from netbox_mcp.oauth.store import StoreWriteError
 
 logger = logging.getLogger(__name__)
@@ -141,12 +142,15 @@ class _RateLimiter:
     def allow(self, key: str) -> bool:
         now = token_time.now()
         cutoff = now - self.window
-        if len(self._hits) > _RATE_KEYS_MAX:
+        if key not in self._hits and len(self._hits) >= _RATE_KEYS_MAX:
             self._hits = {
                 k: kept
                 for k, v in self._hits.items()
                 if (kept := [t for t in v if t > cutoff])
             }
+            if len(self._hits) >= _RATE_KEYS_MAX:
+                # Hard bound: with this many active callers, new ones wait.
+                return False
         hits = [t for t in self._hits.get(key, ()) if t > cutoff]
         allowed = len(hits) < self.limit
         if allowed:
@@ -196,6 +200,34 @@ def _json_error(status: int, error: str, description: str) -> Response:
     )
 
 
+Handler = Callable[[Request], Awaitable[Response]]
+
+
+def _store_guard(handler: Handler, *, json_errors: bool = False) -> Handler:
+    """Answer 503 when the store is unusable (e.g. after an uncertain commit).
+
+    Handlers catch ``StoreWriteError`` where a write fails; this catches any
+    other ``StoreError``, such as ``snapshot()`` on a failed store.
+    """
+
+    async def guarded(request: Request) -> Response:
+        try:
+            return await handler(request)
+        except StoreError:
+            logger.error("oauth: state store unusable; request refused")
+            if json_errors:
+                return _json_error(
+                    503, "temporarily_unavailable", "state store unavailable"
+                )
+            return _error_page(
+                503,
+                "temporarily_unavailable",
+                "The service is temporarily unavailable.",
+            )
+
+    return guarded
+
+
 class OAuthEndpoints:
     """Request handlers of the authorization server (one instance per app)."""
 
@@ -234,12 +266,16 @@ class OAuthEndpoints:
     def _fresh(flow: Flow) -> bool:
         return token_time.now() - flow.created_at < FLOW_TTL
 
-    async def _claim(self, flow_id: str, *, consent: bool, grant: bool = False) -> Flow:
+    async def _claim(
+        self, flow_id: str, *, consent: bool, grant: bool = False
+    ) -> tuple[Flow, Link | None]:
         """Atomically take over a flow before any await on IdP or NetBox.
 
         ``consent`` selects the phase: False for the IdP callback (no user
-        yet), True for the consent step. ``grant`` records the consent grant
-        in the same write.
+        yet), True for the consent step. Returns the flow and, in the consent
+        phase, the user's identity link read in the same write. ``grant``
+        records the consent grant in that write, but only if the link still
+        exists.
 
         Raises:
             _FlowUnusable: Missing, expired, already claimed or wrong phase.
@@ -255,13 +291,14 @@ class OAuthEndpoints:
             ):
                 raise _FlowUnusable
             flow.claimed = True
-            if grant and flow.user_key is not None:
-                state.grants[f"{flow.user_key}|{flow.client_id}"] = Grant(
-                    user_key=flow.user_key,
+            link = state.links.get(flow.user_key) if flow.user_key else None
+            if grant and link is not None:
+                state.grants[f"{link.user_key}|{flow.client_id}"] = Grant(
+                    user_key=link.user_key,
                     client_id=flow.client_id,
                     created_at=token_time.now(),
                 )
-            return flow.model_copy()
+            return flow.model_copy(), link.model_copy() if link else None
 
     async def _drop_flow(self, flow_id: str, client_id: str | None = None) -> None:
         """Delete a finished flow (best effort; expired flows are purged too)."""
@@ -271,7 +308,7 @@ class OAuthEndpoints:
                 client = state.clients.get(client_id) if client_id else None
                 if client is not None:
                     client.last_used_at = token_time.now()
-        except StoreWriteError:
+        except StoreError:
             logger.warning("oauth: could not delete a finished login flow")
 
     # ---------------------------------------------------------- redirects
@@ -301,7 +338,10 @@ class OAuthEndpoints:
         return self._clear_flow_cookie(_error_page(status, error, message))
 
     def _client_name(self, flow: Flow) -> str:
-        client = self.store.snapshot().clients.get(flow.client_id)
+        try:
+            client = self.store.snapshot().clients.get(flow.client_id)
+        except StoreError:
+            return "?"
         return client.client_name if client else "?"
 
     # -------------------------------------------------------- /register
@@ -477,7 +517,7 @@ class OAuthEndpoints:
                 400, "invalid_request", "The sign-in response does not match."
             )
         try:
-            flow = await self._claim(flow_id, consent=False)
+            flow, _ = await self._claim(flow_id, consent=False)
         except _FlowUnusable:
             return _error_page(
                 400,
@@ -598,7 +638,9 @@ class OAuthEndpoints:
         if decision not in ("approve", "deny"):
             return _error_page(400, "invalid_request", "No decision was made.")
         try:
-            flow = await self._claim(flow_id, consent=True, grant=decision == "approve")
+            flow, link = await self._claim(
+                flow_id, consent=True, grant=decision == "approve"
+            )
         except _FlowUnusable:
             return _error_page(
                 400,
@@ -611,7 +653,6 @@ class OAuthEndpoints:
             )
         if decision == "deny":
             return await self._deny(flow, "consent_denied", 303)
-        link = self.store.snapshot().links.get(flow.user_key or "")
         if link is None or flow.idp_refresh_token is None:
             return await self._fail(
                 flow, 400, "invalid_request", "This sign-in is no longer valid."
@@ -631,7 +672,12 @@ class OAuthEndpoints:
             )
         try:
             session, code = await self.manager.create_session(
-                link, client, idp_refresh_token
+                link,
+                client,
+                idp_refresh_token,
+                redirect_uri=flow.redirect_uri,
+                code_challenge=flow.code_challenge,
+                resource=flow.resource,
             )
         except LoginFailed:
             return await self._fail(
@@ -669,11 +715,11 @@ def oauth_routes(config: OAuthConfig, manager: SessionManager) -> list[Route]:
     """
     endpoints = OAuthEndpoints(config, manager)
     base = f"{config.base_path}/oauth"
-    handlers: list[tuple[str, Callable[[Request], Awaitable[Response]], list[str]]] = [
-        ("register", endpoints.register, ["POST"]),
-        ("authorize", endpoints.authorize, ["GET"]),
-        ("callback", endpoints.callback, ["GET"]),
-        ("consent", endpoints.consent, ["GET", "POST"]),
+    handlers: list[tuple[str, Handler, list[str]]] = [
+        ("register", _store_guard(endpoints.register, json_errors=True), ["POST"]),
+        ("authorize", _store_guard(endpoints.authorize), ["GET"]),
+        ("callback", _store_guard(endpoints.callback), ["GET"]),
+        ("consent", _store_guard(endpoints.consent), ["GET", "POST"]),
     ]
     routes = [Route(f"{base}/{name}", fn, methods=m) for name, fn, m in handlers]
     for name, fn, methods in handlers:

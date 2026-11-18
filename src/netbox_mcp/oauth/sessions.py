@@ -234,9 +234,20 @@ class SessionManager:
             logger.warning("oauth: could not drop pending marker")
 
     async def create_session(
-        self, link: Link, client: Client, idp_refresh_token: str
+        self,
+        link: Link,
+        client: Client,
+        idp_refresh_token: str,
+        *,
+        redirect_uri: str,
+        code_challenge: str,
+        resource: str | None,
     ) -> tuple[Session, str]:
         """Create a session with its own NetBox token; return it and the code.
+
+        ``redirect_uri``, ``code_challenge`` and ``resource`` come from the
+        authorization request and are stored with the code hash, so the token
+        endpoint can check them when the code is redeemed.
 
         Raises:
             LoginFailed: The token create outcome is unknown or refused.
@@ -273,6 +284,9 @@ class SessionManager:
             created_at=now,
             code_hash=token_time.hash_secret(code),
             code_expires_at=now + CODE_TTL,
+            code_redirect_uri=redirect_uri,
+            code_challenge=code_challenge,
+            code_resource=resource,
             refresh_deadline=now + REFRESH_TTL,
             idp_refresh_token=idp_refresh_token,
             last_idp_check_at=now,
