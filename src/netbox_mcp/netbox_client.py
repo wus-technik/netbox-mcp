@@ -5,6 +5,8 @@ import os
 import re
 from typing import Any
 from typing import ClassVar
+from typing import Literal
+from typing import Protocol
 
 import httpx2
 from fastmcp.server.dependencies import get_access_token
@@ -92,6 +94,41 @@ def auth_header(token: str | None) -> dict[str, str]:
 
 class MissingTokenError(Exception):
     """Token passthrough is on but the current request carries no NetBox token."""
+
+
+class OAuthSessionError(Exception):
+    """An OAuth session's NetBox token is no longer usable for this call."""
+
+
+class OAuthSessions(Protocol):
+    """What the client needs from the OAuth session manager (spec 6.3)."""
+
+    async def handle_netbox_rejection(
+        self, sid: str, used_version: int
+    ) -> Literal["retry", "ended", "permission", "unavailable"]: ...
+
+    def current_token(self, sid: str) -> tuple[str, int] | None: ...
+
+
+# Set by the OAuth outer app while it runs; None in every other mode.
+_oauth_sessions: OAuthSessions | None = None
+
+
+def set_oauth_sessions(sessions: OAuthSessions | None) -> None:
+    """Register (or clear) the session manager that handles 401/403 answers."""
+    global _oauth_sessions
+    _oauth_sessions = sessions
+
+
+# Statuses NetBox answers when it does not accept the token.
+TOKEN_REJECTED = frozenset({401, 403})
+SESSION_ENDED_MESSAGE = (
+    "NetBox no longer accepts this session's token: authorization expired, "
+    "reconnect the MCP client to log in again."
+)
+SESSION_UNAVAILABLE_MESSAGE = (
+    "NetBox rejected the token and could not be asked why; retry later."
+)
 
 
 class NetBoxAPIError(Exception):
@@ -188,6 +225,8 @@ class NetBoxClient:
         self._http: httpx2.AsyncClient | None = None
         # Hash of the token in use, set on entry; keys the per-caller caches.
         self._identity = ""
+        # (sid, token_version) when the token came from an OAuth session.
+        self._oauth: tuple[str, int] | None = None
 
     @classmethod
     def reset_cache(cls) -> None:
@@ -210,12 +249,25 @@ class NetBoxClient:
             MissingTokenError: If an explicit token is empty, or passthrough is
                 on and the request has no token.
         """
+        self._oauth = None
         if self._token is not None:
             if not self._token:
                 raise MissingTokenError("An empty NetBox token was given.")
             return self._token
+        access_token = get_access_token()
+        if (
+            access_token is not None
+            and access_token.claims.get("netbox_mcp_auth_mode") == "oauth"
+        ):
+            claims = access_token.claims
+            # OAuth mode: the session's own NetBox token, put there by the
+            # verifier. Only this path reports NetBox rejections to the
+            # session manager; an explicit ``token`` (the broker) never does.
+            if not access_token.token:
+                raise MissingTokenError("The OAuth session has no NetBox token.")
+            self._oauth = (claims["sid"], claims["token_version"])
+            return access_token.token
         if self.config.token_passthrough:
-            access_token = get_access_token()
             if access_token is None or not access_token.token:
                 raise MissingTokenError(
                     "No NetBox token on this request. Send your NetBox API token "
@@ -244,7 +296,46 @@ class NetBoxClient:
 
     # ------------------------------------------------------------------ core
 
-    async def request(
+    async def request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Send one request and return the decoded JSON body.
+
+        Takes the arguments of :meth:`_request_once`. With an OAuth session
+        token, a 401/403 is reported to the session manager (spec 6.3): the
+        call is retried once if the session holds a newer token, and fails
+        with :class:`OAuthSessionError` if the session ended or NetBox could
+        not be asked. An ordinary permission error is raised unchanged.
+        """
+        try:
+            return await self._request_once(method, path, **kwargs)
+        except NetBoxAPIError as exc:
+            if exc.status not in TOKEN_REJECTED or not await self._oauth_retry():
+                raise
+        return await self._request_once(method, path, **kwargs)
+
+    async def _oauth_retry(self) -> bool:
+        """Handle a rejected OAuth session token; True means send again."""
+        sessions = _oauth_sessions
+        if self._oauth is None or sessions is None or self._http is None:
+            return False
+        sid, version = self._oauth
+        outcome = await sessions.handle_netbox_rejection(sid, version)
+        if outcome == "permission":
+            return False
+        if outcome == "retry":
+            current = sessions.current_token(sid)
+            if current is not None:
+                bearer, new_version = current
+                self._http.headers.update(auth_header(bearer))
+                self._identity = token_fingerprint(bearer)
+                self._oauth = (sid, new_version)
+                logger.info("oauth: retrying with renewed token sid=%s", sid[:8])
+                return True
+            outcome = "ended"
+        if outcome == "ended":
+            raise OAuthSessionError(SESSION_ENDED_MESSAGE)
+        raise OAuthSessionError(SESSION_UNAVAILABLE_MESSAGE)
+
+    async def _request_once(
         self,
         method: str,
         path: str,
@@ -320,7 +411,7 @@ class NetBoxClient:
 
         if response.status_code == 404 and fallback_path:
             logger.debug("%s returned 404, trying %s", path, fallback_path)
-            return await self.request(
+            return await self._request_once(
                 method,
                 fallback_path,
                 params=params,
@@ -357,7 +448,8 @@ class NetBoxClient:
         Raises:
             ValueError: If the method changed along the redirect chain.
         """
-        final_url = response.request.url
+        # Without the query: it can carry filters such as usernames or nonces.
+        final_url = response.request.url.copy_with(query=None)
         if response.request.method != method:
             raise ValueError(
                 f"{method} {path} was redirected to {final_url} and turned into a "
@@ -369,7 +461,7 @@ class NetBoxClient:
             logger.warning(
                 "NetBox redirects %s to %s - set NETBOX_URL to the final address "
                 "to avoid an extra round trip on every call.",
-                response.history[0].request.url,
+                response.history[0].request.url.copy_with(query=None),
                 final_url,
             )
 

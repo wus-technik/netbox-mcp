@@ -49,6 +49,7 @@ SERVER_ENV_VARS = (
     "MCP_HTTP_PORT",
     "MCP_HTTP_BEARER_TOKEN",
     "SENTRY_DSN",
+    "OIDC_ISSUER",
 )
 
 

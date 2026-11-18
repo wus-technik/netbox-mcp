@@ -83,6 +83,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="List NetBox object types",
         tags={"netbox", "objects", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -127,6 +128,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="List NetBox objects",
         tags={"netbox", "objects", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -187,6 +189,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Get a NetBox object",
         tags={"netbox", "objects", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -215,6 +218,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Search NetBox objects",
         tags={"netbox", "search", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -307,6 +311,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Describe a NetBox object type",
         tags={"netbox", "objects", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -360,6 +365,7 @@ def register_objects_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Get NetBox change log",
         tags={"netbox", "changelog", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )

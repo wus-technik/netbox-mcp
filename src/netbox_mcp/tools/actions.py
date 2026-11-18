@@ -186,6 +186,7 @@ def register_actions_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Run a custom script",
         tags={"netbox", "write", "scripts"},
         annotations=RUN_ANNOTATIONS,
     )
@@ -282,6 +283,7 @@ def register_actions_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Connect a cable",
         tags={"netbox", "write", "dcim"},
         annotations=CREATE_ANNOTATIONS,
     )

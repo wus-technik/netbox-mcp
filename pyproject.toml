@@ -30,9 +30,11 @@ classifiers = [
 ]
 
 dependencies = [
+    "cryptography>=50.0.2",
     "fastmcp>=4.1.2,<5",
     "httpx2>=2.13.0",
     "pydantic>=2.12.0",
+    "pyjwt[crypto]>=2.15.1",
     "python-dotenv>=1.2.2",
 ]
 
@@ -54,7 +56,7 @@ dev = [
 ]
 
 [project.scripts]
-netbox-mcp = "netbox_mcp.server:main"
+netbox-mcp = "netbox_mcp.cli_entry:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/netbox_mcp"]

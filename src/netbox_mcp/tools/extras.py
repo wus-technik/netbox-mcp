@@ -114,6 +114,7 @@ def register_extras_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Get NetBox status",
         tags={"netbox", "status", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -148,6 +149,7 @@ def register_extras_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Run a read-only GraphQL query",
         tags={"netbox", "graphql", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -198,6 +200,7 @@ def register_extras_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Get available IPs, prefixes, VLANs or ASNs",
         tags={"netbox", "ipam", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -230,6 +233,7 @@ def register_extras_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Trace a cable path",
         tags={"netbox", "dcim", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -293,6 +297,7 @@ def register_extras_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Render a device configuration",
         tags={"netbox", "config", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )

@@ -49,6 +49,7 @@ def register_branching_tools(
     @netbox_tool(
         mcp,
         config,
+        title="List branches",
         tags={"netbox", "branching", READ_ONLY_TAG},
         annotations=READ_ANNOTATIONS,
     )
@@ -98,6 +99,7 @@ def register_branching_tools(
     @netbox_tool(
         mcp,
         config,
+        title="Create a branch",
         tags={"netbox", "branching", "write"},
         annotations=CREATE_ANNOTATIONS,
     )
