@@ -73,28 +73,41 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 # Body key that marks a request of the SDK's modern (2026) protocol era.
 MODERN_VERSION_META = "io.modelcontextprotocol/protocolVersion"
 _PROTOCOL_HEADER = b"mcp-protocol-version"
+_DISCONNECTED = object()
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # Future protocol dates tolerated beyond the newest the SDK knows (spec 7.2).
 FUTURE_TOLERANCE_YEARS = 2
 
-# Set by the outer lifespan while it starts the FastMCP app; the FastMCP
-# lifespan of OAuth mode refuses to start without it (``fastmcp run``).
-_launched: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "netbox_mcp_oauth_launched", default=False
+# The FastMCP server the outer lifespan is starting; its OAuth-mode lifespan
+# refuses to start unless it is that very server (``fastmcp run``).
+_launched: contextvars.ContextVar[FastMCP | None] = contextvars.ContextVar(
+    "netbox_mcp_oauth_launched", default=None
 )
+# HTTP client loggers print full request URLs, query strings included.
+HTTP_CLIENT_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2")
 
 
 @contextlib.asynccontextmanager
-async def oauth_launch_guard(_server: FastMCP) -> AsyncGenerator[dict[str, Any]]:
+async def oauth_launch_guard(server: FastMCP) -> AsyncGenerator[dict[str, Any]]:
     """FastMCP lifespan for OAuth mode: only the outer app may start it.
 
     Raises:
         RuntimeError: When started by anything but :func:`build_oauth_app`'s
             lifespan, e.g. ``fastmcp run`` / ``fastmcp.json``.
     """
-    if not _launched.get():
+    if _launched.get() is not server:
         raise RuntimeError(LAUNCH_ERROR)
     yield {}
+
+
+def configure_oauth_logging() -> None:
+    """Keep URLs with query strings out of the log in OAuth mode (spec 9).
+
+    The HTTP client libraries log every request URL at INFO; NetBox and IdP
+    lookups carry user names and filters in the query.
+    """
+    for name in HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @contextlib.asynccontextmanager
@@ -152,13 +165,14 @@ def protocol_decision(header: str | None, body: Any, today: datetime.date) -> st
     every other header to its 2026 handler, which knows no ``initialize``.
     Clients that send ``2026-07-28`` (or a later date) with 2025-style bodies
     are therefore served as ``LATEST_HANDSHAKE_VERSION``. Requests in the 2026
-    shape carry their version in the body and pass unchanged.
+    shape carry their version in the body and pass unchanged, but only with
+    a supported header: the SDK routes on the header alone.
     """
     message = body if isinstance(body, dict) else {}
     params = message.get("params")
     meta = params.get("_meta") if isinstance(params, dict) else None
     if isinstance(meta, dict) and MODERN_VERSION_META in meta:
-        return "pass"
+        return "pass" if header in SUPPORTED_PROTOCOL_VERSIONS else "reject"
     if header is None or header in HANDSHAKE_PROTOCOL_VERSIONS:
         return "pass"
     if header in SUPPORTED_PROTOCOL_VERSIONS or _tolerated_future(header, today):
@@ -207,7 +221,11 @@ class McpEndpointLayer:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        kind = self._classify(scope["path"])
+        root = scope.get("root_path", "")
+        path = scope["path"]
+        if root and path.startswith(root):
+            path = path[len(root) :]  # the path below the mount point
+        kind = self._classify(path)
         if kind is None:
             await self.app(scope, receive, send)
             return
@@ -225,8 +243,8 @@ class McpEndpointLayer:
             )
             return
         scope = dict(scope)
-        scope["path"] = self.mcp_path
-        scope["raw_path"] = self.mcp_path.encode()
+        scope["path"] = root + self.mcp_path
+        scope["raw_path"] = scope["path"].encode()
         await self._authenticated(scope, receive, send, headers)
 
     async def _authenticated(
@@ -261,6 +279,9 @@ class McpEndpointLayer:
                 scope, receive, send
             )
             return
+        if not isinstance(body, bytes):  # _DISCONNECTED: nobody to answer
+            logger.info("mcp request: client disconnected before the body arrived")
+            return
         try:
             message = json.loads(body)
         except ValueError:
@@ -277,7 +298,7 @@ class McpEndpointLayer:
                 else (k, v)
                 for k, v in scope["headers"]
             ]
-        self._log_tool_call(scope, access.claims, access.client_id, message)
+        self._log_tool_call(scope, access.claims, message)
         marker = self.verifier.remember(token, access)
         try:
             await self.app(scope, _replay(body, receive), send)
@@ -315,13 +336,15 @@ class McpEndpointLayer:
         )(scope, receive, send)
 
     @staticmethod
-    async def _read_body(receive: Receive) -> bytes | None:
+    async def _read_body(receive: Receive) -> bytes | object | None:
+        """The whole body; None if too large, ``_DISCONNECTED`` if the client
+        went away before it was complete."""
         chunks: list[bytes] = []
         size = 0
         while True:
             message = await receive()
             if message["type"] != "http.request":
-                break
+                return _DISCONNECTED
             chunk = message.get("body", b"")
             size += len(chunk)
             if size > MAX_BODY_BYTES:
@@ -331,19 +354,21 @@ class McpEndpointLayer:
                 break
         return b"".join(chunks)
 
-    @staticmethod
     def _log_tool_call(
-        scope: Scope, claims: dict[str, Any], client_id: str, message: Any
+        self, scope: Scope, claims: dict[str, Any], message: Any
     ) -> None:
         if not isinstance(message, dict) or message.get("method") != "tools/call":
             return
         params = message.get("params")
         name = params.get("name") if isinstance(params, dict) else None
+        sid = str(claims.get("sid", ""))
+        manager = self.verifier.manager
+        user, client = manager.session_labels(sid) if manager else ("-", "-")
         logger.info(
             "tool_call user=%s client=%s sid=%s tool=%s path=%s",
-            claims.get("sub"),
-            _printable(client_id),
-            str(claims.get("sid", ""))[:8],
+            _printable(user),
+            _printable(client),
+            sid[:8],
             _printable(name) if isinstance(name, str) else "-",
             scope["path"],
         )
@@ -431,7 +456,7 @@ def build_oauth_app(
             app.state.oauth_manager = manager
             verifier.bind(manager)
             netbox_client.set_oauth_sessions(manager)
-            launched = _launched.set(True)
+            launched = _launched.set(mcp)
             try:
                 async with mcp_app.lifespan(mcp_app), background(manager):
                     logger.info("OAuth mode: serving MCP at %s", config.public_url)

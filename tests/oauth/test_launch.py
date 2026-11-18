@@ -145,3 +145,38 @@ async def test_startup_fails_when_state_file_missing(
         async with app.router.lifespan_context(app):
             pass
     assert server.mcp.auth.manager is None
+
+
+async def test_launch_marker_is_bound_to_the_started_server():
+    """A marker set for one FastMCP server does not let another one start."""
+    from fastmcp import FastMCP
+
+    from netbox_mcp.oauth import app as oauth_app
+
+    started, other = FastMCP("started"), FastMCP("other")
+    marker = oauth_app._launched.set(started)
+    try:
+        with pytest.raises(RuntimeError, match=LAUNCH_ERROR):
+            async with oauth_app.oauth_launch_guard(other):
+                pass
+        async with oauth_app.oauth_launch_guard(started) as state:
+            assert state == {}
+    finally:
+        oauth_app._launched.reset(marker)
+
+
+@pytest.mark.usefixtures("oauth_env")
+def test_main_quiets_http_client_loggers(load_server, run_uvicorn):  # noqa: F811
+    names = ("httpx", "httpx2", "httpcore", "httpcore2")
+    saved = {n: logging.getLogger(n).level for n in names}
+    try:
+        for name in names:
+            logging.getLogger(name).setLevel(logging.NOTSET)
+        load_server(MCP_TRANSPORT="http").main()
+        assert {n: logging.getLogger(n).level for n in names} == dict.fromkeys(
+            names, logging.WARNING
+        )
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)
+    run_uvicorn.assert_called_once()

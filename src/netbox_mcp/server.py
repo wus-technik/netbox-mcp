@@ -27,6 +27,7 @@ from netbox_mcp.auth import rate_limit_client_id
 from netbox_mcp.netbox_client import get_netbox_config_from_env
 from netbox_mcp.netbox_client import get_transport_config_from_env
 from netbox_mcp.oauth.app import build_oauth_app
+from netbox_mcp.oauth.app import configure_oauth_logging
 from netbox_mcp.oauth.app import oauth_launch_guard
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.config import get_oauth_config_from_env
@@ -203,6 +204,7 @@ if NETBOX_CONFIG.rate_limit_enabled:
 
 def run_oauth(oauth_config: OAuthConfig) -> None:
     """Serve OAuth mode: the outer app around FastMCP, via uvicorn."""
+    configure_oauth_logging()
     if NETBOX_TOKEN_IGNORED:
         logger.warning(
             "NETBOX_TOKEN is ignored: OAuth mode calls NetBox with each "

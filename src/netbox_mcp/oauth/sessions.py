@@ -467,6 +467,23 @@ class SessionManager:
         logger.info("session_ended sid=%s reason=%s", sid[:8], reason)
         self.cleanup_wanted.set()
 
+    def session_labels(self, sid: str) -> tuple[str, str]:
+        """``(NetBox username, client name)`` of a session for log lines;
+        ``"-"`` where unknown."""
+        try:
+            state = self.store.snapshot()
+        except StoreError:
+            return "-", "-"
+        session = state.sessions.get(sid)
+        if session is None:
+            return "-", "-"
+        link = state.links.get(session.user_key)
+        client = state.clients.get(session.client_id)
+        return (
+            link.netbox_username if link else "-",
+            (client.client_name or "-") if client else "-",
+        )
+
     # ------------------------------------------------- NetBox rejections
 
     async def handle_netbox_rejection(

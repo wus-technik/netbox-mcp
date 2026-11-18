@@ -24,7 +24,9 @@ from netbox_mcp.auth import rate_limit_client_id
 from netbox_mcp.models import NetBoxConfig
 from netbox_mcp.netbox_client import NetBoxAPIError
 from netbox_mcp.netbox_client import NetBoxClient
+from netbox_mcp.oauth.app import HTTP_CLIENT_LOGGERS
 from netbox_mcp.oauth.app import build_oauth_app
+from netbox_mcp.oauth.app import configure_oauth_logging
 from netbox_mcp.oauth.app import oauth_launch_guard
 from netbox_mcp.oauth.metadata import challenge_header
 from netbox_mcp.oauth.sessions import SessionManager
@@ -650,6 +652,24 @@ def test_rate_limit_keyed_by_user_not_client():
 # ------------------------------------------------------------------ logging
 
 
+@pytest.fixture
+def oauth_logging():
+    """Apply main()'s OAuth logging setup; restore the levels afterwards."""
+    saved = {n: logging.getLogger(n).level for n in HTTP_CLIENT_LOGGERS}
+    configure_oauth_logging()
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
+
+
+def _test_client_record(record: logging.LogRecord) -> bool:
+    """Records of this test's own HTTP clients: requests to the server under
+    test and the browser leg of the IdP login (the server never calls it)."""
+    message = record.getMessage()
+    return BASE in message or "/authorize?" in message
+
+
+@pytest.mark.usefixtures("oauth_logging")
 async def test_log_events_contain_no_secrets(env, caplog):
     e, _ = env
     caplog.set_level(logging.DEBUG)
@@ -666,12 +686,15 @@ async def test_log_events_contain_no_secrets(env, caplog):
     e.netbox.delete_token(session.netbox_token_id)
     await post(e.http, sites_call(2), refreshed.json()["access_token"])
 
-    # The test's own HTTP client logs the IdP redirect URLs it follows; only
-    # the server's records are under test.
-    text = "\n".join(
-        r.getMessage() for r in caplog.records if not r.name.startswith("httpx")
+    records = [r for r in caplog.records if not _test_client_record(r)]
+    text = "\n".join(r.getMessage() for r in records)
+    # NetBox and IdP lookups carry user names and filters in the query.
+    assert "?" not in "".join(
+        r.getMessage() for r in records if r.name.startswith(HTTP_CLIENT_LOGGERS)
     )
-    assert "tool_call" in text
+    assert "tool_call user=alice " in text
+    tool_lines = [line for line in text.splitlines() if "tool_call" in line]
+    assert all(session.user_key not in line for line in tool_lines)
     assert "session_ended" in text
     assert "token_refreshed" in text
     for secret in (
@@ -754,3 +777,110 @@ def test_sdk_protocol_version_contract():
     assert "2026-07-28" in SUPPORTED_PROTOCOL_VERSIONS
     assert "2026-07-28" not in HANDSHAKE_PROTOCOL_VERSIONS
     assert max(KNOWN_PROTOCOL_VERSIONS) == "2026-07-28"
+
+
+# ------------------------------------------------- fix round 1 (review)
+
+MODERN_LIST = rpc(
+    "tools/list",
+    {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}},
+    9,
+)
+OUR_VERSION_ERROR = "Unsupported MCP-Protocol-Version"
+
+
+@pytest.mark.parametrize("header", ["garbage", "2027-01-01", "2099-01-01", None])
+async def test_modern_body_needs_supported_header(env, header):
+    e, _ = env
+    token = await login(e)
+    resp = await post(e.http, MODERN_LIST, token, version=header)
+    assert resp.status_code == 400, resp.text
+    assert OUR_VERSION_ERROR in resp.json()["error"]["message"]
+    assert resp.json()["id"] == 9
+
+
+async def test_modern_body_with_supported_header_passes(env):
+    e, _ = env
+    token = await login(e)
+    resp = await post(e.http, MODERN_LIST, token, version="2026-07-28")
+    assert OUR_VERSION_ERROR not in resp.text
+
+
+async def test_disconnect_mid_body_is_not_dispatched(env):
+    e, _ = env
+    token = await login(e)
+    chunks = [
+        {"type": "http.request", "body": b'{"jsonrpc": "2.0", ', "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+    sent: list = []
+
+    async def receive():
+        return chunks.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "server": ("mcp.example.com", 443),
+        "client": ("127.0.0.1", 5000),
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"mcp.example.com"),
+            (b"authorization", f"Bearer {token}".encode()),
+            (b"content-type", b"application/json"),
+            (b"accept", ACCEPT.encode()),
+        ],
+    }
+    await e.app(scope, receive, send)
+    assert sent == []
+
+
+async def test_root_path_does_not_bypass_classification(
+    oauth_config, fake_idp, fake_netbox_tokens
+):
+    StateStore.create(oauth_config.state_path, oauth_config.state_key)
+    nb_config = NetBoxConfig(netbox_url=fake_netbox_tokens.base_url, token=None)
+    mcp = FastMCP(
+        "t", auth=OAuthTokenVerifier(oauth_config), lifespan=oauth_launch_guard
+    )
+    app = build_oauth_app(
+        mcp,
+        oauth_config,
+        netbox_config=nb_config,
+        idp_transport=fake_idp.transport,
+        netbox_transport=fake_netbox_tokens.transport,
+    )
+    async with (
+        running(app),
+        httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app, root_path="/prefix"),
+            base_url=BASE,
+        ) as http,
+    ):
+        served = await post(http, INIT, path="/prefix/mcp")
+        slash = await post(http, INIT, path="/prefix/mcp/")
+        bad = [
+            await post(http, INIT, path=p)
+            for p in ("/prefix/mcp//", "/prefix/MCP", "/prefix//mcp")
+        ]
+        evil = await post(
+            http, INIT, path="/prefix/mcp", headers={"Origin": "https://evil.example"}
+        )
+    # Reaching the outer authentication proves the layer classified the path.
+    assert served.status_code == 401
+    assert served.headers["www-authenticate"] == challenge_header(
+        oauth_config, invalid_token=False
+    )
+    assert slash.status_code == 401
+    assert [r.status_code for r in bad] == [404, 404, 404]
+    assert all("location" not in r.headers for r in bad)
+    assert evil.status_code == 403
