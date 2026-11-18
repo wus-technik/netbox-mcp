@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import httpx2
 import pytest
 
+from netbox_mcp.oauth.jobs import Jobs
 from netbox_mcp.oauth.store import StateStore
 from netbox_mcp.oauth.store import StoreError
 from netbox_mcp.oauth.store import StoreLocked
@@ -73,6 +74,18 @@ async def test_main_builds_outer_app(load_server, oauth_env, run_uvicorn, monkey
         discovered.append(self)
 
     monkeypatch.setattr("netbox_mcp.oauth.idp.IdpClient.discover", discover)
+    events: list[str] = []
+
+    class SpyJobs(Jobs):
+        def start(self):
+            events.append("start")
+            super().start()
+
+        async def stop(self):
+            events.append("stop")
+            await super().stop()
+
+    monkeypatch.setattr("netbox_mcp.oauth.app.Jobs", SpyJobs)
     server = load_server(MCP_TRANSPORT="http")
 
     server.main()
@@ -83,6 +96,7 @@ async def test_main_builds_outer_app(load_server, oauth_env, run_uvicorn, monkey
     assert app.state.netbox_mcp_outer is True
     async with app.router.lifespan_context(app):
         assert len(discovered) == 1
+        assert events == ["start"]
         async with httpx2.AsyncClient(
             transport=httpx2.ASGITransport(app=app), base_url="https://mcp.example.com"
         ) as http:
@@ -91,6 +105,7 @@ async def test_main_builds_outer_app(load_server, oauth_env, run_uvicorn, monkey
         assert server.mcp.auth.manager is app.state.oauth_manager
         with pytest.raises(StoreLocked):
             StateStore.open(oauth_env, b"k" * 32)
+    assert events == ["start", "stop"]
     assert server.mcp.auth.manager is None
     StateStore.open(oauth_env, b"k" * 32).close()
 

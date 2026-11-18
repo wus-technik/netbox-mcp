@@ -56,6 +56,7 @@ from netbox_mcp.oauth import tokens as token_time
 from netbox_mcp.oauth.broker import NetBoxBroker
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.idp import IdpClient
+from netbox_mcp.oauth.jobs import Jobs
 from netbox_mcp.oauth.metadata import challenge_header
 from netbox_mcp.oauth.metadata import metadata_routes
 from netbox_mcp.oauth.routes import oauth_routes
@@ -111,9 +112,15 @@ def configure_oauth_logging() -> None:
 
 
 @contextlib.asynccontextmanager
-async def start_background(_manager: SessionManager) -> AsyncGenerator[None]:
-    """Hook for background jobs running alongside the server (none yet)."""
-    yield
+async def start_background(manager: SessionManager) -> AsyncGenerator[None]:
+    """Run the background jobs (cleanup, recovery, daily check) for the server's
+    lifetime; shutdown cancels them and waits for their tasks."""
+    jobs = Jobs(manager)
+    jobs.start()
+    try:
+        yield
+    finally:
+        await jobs.stop()
 
 
 # ------------------------------------------------------------- endpoint rules

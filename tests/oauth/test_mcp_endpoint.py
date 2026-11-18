@@ -41,6 +41,14 @@ from tests.oauth.fakes import FakeNetBoxTokens
 from tests.oauth.test_token_endpoint import tokens_for
 
 BASE = "https://mcp.example.com"
+
+
+@contextlib.asynccontextmanager
+async def idle_background(_manager: SessionManager) -> AsyncIterator[None]:
+    """No background jobs: these tests inspect the cleanup queue themselves."""
+    yield
+
+
 ACCEPT = "application/json, text/event-stream"
 DAY = 86400
 
@@ -123,6 +131,7 @@ async def env(
         netbox_config=nb_config,
         idp_transport=fake_idp.transport,
         netbox_transport=fake_netbox_tokens.transport,
+        background=idle_background,
     )
     async with (
         running(app),
@@ -553,6 +562,7 @@ async def test_extra_origins_allowed(oauth_config, fake_idp, fake_netbox_tokens)
         netbox_config=nb_config,
         idp_transport=fake_idp.transport,
         netbox_transport=fake_netbox_tokens.transport,
+        background=idle_background,
     )
     async with (
         app.router.lifespan_context(app),
@@ -858,6 +868,7 @@ async def test_root_path_does_not_bypass_classification(
         netbox_config=nb_config,
         idp_transport=fake_idp.transport,
         netbox_transport=fake_netbox_tokens.transport,
+        background=idle_background,
     )
     async with (
         running(app),

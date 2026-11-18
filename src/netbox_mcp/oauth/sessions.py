@@ -50,6 +50,13 @@ CODE_TTL = 300
 REFRESH_TTL = 30 * 86400
 REPLAY_WINDOW = 30
 DESCRIPTION_MAX = 200
+# Orphan sessions, pending-create markers and login flows share a 10 minute age.
+ORPHAN_TTL = 600
+MARKER_MIN_AGE = 600
+FLOW_MAX_AGE = 600
+CLIENT_IDLE_TTL = 30 * 86400
+CLEANUP_WARN_AGE = 7 * 86400
+CLEANUP_WARN_EVERY = 86400
 
 _NO_USER_MESSAGE = (
     "No active NetBox account matches your identity. "
@@ -131,6 +138,8 @@ class SessionManager:
         # write succeeded, so it never runs ahead of disk. Entries are hints:
         # every hit is re-checked against the session under its lock.
         self._hash_index: dict[str, str] | None = None
+        # Background jobs are single-flight: a trigger while one runs is dropped.
+        self._job_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ locks
 
@@ -951,3 +960,209 @@ class SessionManager:
                 logger.warning("revoke ignored: client mismatch sid=%s", sid[:8])
                 return
             await self.end_session_locked(sid, "revoked")
+
+    # ---------------------------------------------------------- background jobs
+
+    def _single_flight(self, name: str) -> asyncio.Lock | None:
+        """The job's lock if the job is idle, else None (caller skips)."""
+        lock = self._job_locks.setdefault(name, asyncio.Lock())
+        return None if lock.locked() else lock
+
+    async def run_cleanup(self) -> None:
+        """Delete the NetBox tokens in the cleanup queue (spec 6.3).
+
+        Single-flight; each entry is tried once per run. A 404 counts as
+        deleted. Failed entries stay queued and are retried by the next run;
+        one older than 7 days logs a warning at most once per 24 hours.
+        """
+        lock = self._single_flight("cleanup")
+        if lock is None:
+            return
+        async with lock:
+            for entry in list(self.store.snapshot().cleanup.values()):
+                try:
+                    await self.broker.delete_token(entry.netbox_token_id)
+                except BrokerError:
+                    await self._cleanup_failed(entry.entry_id)
+                    continue
+                try:
+                    async with self.store.mutate() as state:
+                        state.cleanup.pop(entry.entry_id, None)
+                except StoreError:
+                    logger.warning("oauth: could not drop cleanup entry")
+
+    async def _cleanup_failed(self, entry_id: str) -> None:
+        now = token_time.now()
+        try:
+            async with self.store.mutate() as state:
+                entry = state.cleanup.get(entry_id)
+                if entry is None:
+                    return
+                entry.last_attempt_at = now
+                if now - entry.created_at > CLEANUP_WARN_AGE and (
+                    entry.warned_at is None
+                    or now - entry.warned_at >= CLEANUP_WARN_EVERY
+                ):
+                    entry.warned_at = now
+                    logger.warning(
+                        "oauth: cleanup entry %s for NetBox token %d is %d days old",
+                        entry_id[:8],
+                        entry.netbox_token_id,
+                        int((now - entry.created_at) // 86400),
+                    )
+        except StoreError:
+            logger.warning("oauth: could not record cleanup attempt")
+
+    async def recover_pending(self) -> None:
+        """Delete tokens left behind by interrupted creations (spec 6.2).
+
+        Markers younger than 10 minutes are skipped: their POST may still be in
+        flight. Single-flight.
+        """
+        lock = self._single_flight("recovery")
+        if lock is None:
+            return
+        async with lock:
+            now = token_time.now()
+            due = [
+                m.nonce
+                for m in self.store.snapshot().pending.values()
+                if now - m.created_at >= MARKER_MIN_AGE
+            ]
+            for nonce in due:
+                await self._recover_marker(nonce)
+
+    async def _recover_marker(self, nonce: str) -> None:
+        marker = self.store.snapshot().pending.get(nonce)
+        if marker is None:
+            return
+        async with self.user_lock(f"netbox-user|{marker.netbox_user_id}"):
+            marker = self.store.snapshot().pending.get(nonce)
+            if marker is None or token_time.now() - marker.created_at < MARKER_MIN_AGE:
+                return
+            try:
+                found = await self.broker.list_tokens(marker.netbox_user_id, nonce)
+                for info in found:
+                    await self.broker.delete_token(info.id)
+            except BrokerError:
+                logger.warning("oauth: token recovery deferred, NetBox unavailable")
+                return
+            try:
+                async with self.store.mutate() as state:
+                    state.pending.pop(nonce, None)
+            except StoreError:
+                logger.warning("oauth: could not drop recovered marker")
+                return
+            if found:
+                logger.info("oauth: recovered %d orphaned NetBox token(s)", len(found))
+
+    async def end_orphans(self) -> None:
+        """End sessions whose code was never exchanged within 10 minutes."""
+        now = token_time.now()
+        for session in list(self.store.snapshot().sessions.values()):
+            if session.code_redeemed or now - session.created_at < ORPHAN_TTL:
+                continue
+            async with self.lock_for(session.sid):
+                current = self.store.snapshot().sessions.get(session.sid)
+                if current is None or current.code_redeemed:
+                    continue
+                await self._end_guarded(session.sid, "orphan")
+
+    async def end_expired(self) -> None:
+        """End sessions past the sliding 30 day deadline or the absolute cap."""
+        now = token_time.now()
+        cap = self.config.max_session_days * 86400
+        for session in list(self.store.snapshot().sessions.values()):
+            if now >= session.refresh_deadline:
+                reason = "expired"
+            elif now - session.created_at >= cap:
+                reason = "max_age"
+            else:
+                continue
+            async with self.lock_for(session.sid):
+                if session.sid in self.store.snapshot().sessions:
+                    await self._end_guarded(session.sid, reason)
+
+    async def _end_guarded(
+        self, sid: str, reason: str, *, drop_grants: bool = False
+    ) -> None:
+        """End a session (lock held); a store failure is logged, not raised."""
+        try:
+            await self.end_session_locked(sid, reason, drop_grants=drop_grants)
+        except StoreError:
+            logger.warning("oauth: could not end session sid=%s", sid[:8])
+
+    async def expire_clients(self) -> None:
+        """Remove registrations unused for 30 days that have no sessions, with
+        their grants (spec 5.2)."""
+        now = token_time.now()
+        try:
+            async with self.store.mutate() as state:
+                live = {s.client_id for s in state.sessions.values()}
+                for client_id in [
+                    c.client_id
+                    for c in state.clients.values()
+                    if now - c.last_used_at >= CLIENT_IDLE_TTL
+                    and c.client_id not in live
+                ]:
+                    del state.clients[client_id]
+                    for key in [
+                        k for k, g in state.grants.items() if g.client_id == client_id
+                    ]:
+                        del state.grants[key]
+        except StoreError:
+            logger.warning("oauth: client expiry failed")
+
+    async def drop_stale_flows(self) -> None:
+        """Remove login flows older than 10 minutes."""
+        now = token_time.now()
+        try:
+            async with self.store.mutate() as state:
+                for flow_id in [
+                    k
+                    for k, f in state.flows.items()
+                    if now - f.created_at >= FLOW_MAX_AGE
+                ]:
+                    del state.flows[flow_id]
+        except StoreError:
+            logger.warning("oauth: flow cleanup failed")
+
+    async def daily_netbox_check(self) -> None:
+        """Check every session against NetBox (spec 6.4): the user exists and is
+        active, the token exists and is enabled; renew a token that is due.
+
+        Does not contact the IdP. NetBox being unavailable keeps the session.
+        Single-flight.
+        """
+        lock = self._single_flight("daily")
+        if lock is None:
+            return
+        async with lock:
+            for sid in list(self.store.snapshot().sessions):
+                try:
+                    await self._check_session(sid)
+                except StoreError:
+                    logger.warning("oauth: daily check store failure sid=%s", sid[:8])
+
+    async def _check_session(self, sid: str) -> None:
+        async with self.lock_for(sid):
+            session = self.store.snapshot().sessions.get(sid)
+            if session is None:
+                return
+            try:
+                user = await self.broker.get_user(session.netbox_user_id)
+                if user is None or not user.is_active:
+                    reason = "no_netbox_user" if user is None else "inactive_user"
+                    await self._end_guarded(sid, reason, drop_grants=True)
+                    return
+                info = await self.broker.get_token(session.netbox_token_id)
+            except BrokerError:
+                logger.warning("oauth: daily check deferred sid=%s", sid[:8])
+                return
+            if info is None or not info.enabled:
+                reason = (
+                    "netbox_token_missing" if info is None else "netbox_token_disabled"
+                )
+                await self._end_guarded(sid, reason)
+                return
+            await self.renew_if_due_locked(sid)
