@@ -774,6 +774,9 @@ class OAuthEndpoints:
                     if not params.get(name)
                 ]
                 if missing:
+                    if params.get("code"):
+                        # Burned on the first attempt, also a malformed one.
+                        await self.manager.burn_code(params["code"])
                     return _json_error(
                         400, "invalid_request", f"missing {', '.join(missing)}"
                     )

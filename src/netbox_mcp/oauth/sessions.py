@@ -472,6 +472,32 @@ class SessionManager:
         computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
         return hmac.compare_digest(computed.encode(), challenge.encode())
 
+    async def burn_code(self, code: str) -> None:
+        """Burn a known, unredeemed code without redeeming it (a malformed
+        request still counts as the first attempt, spec 5.4).
+
+        Raises:
+            StoreWriteError: The burn could not be persisted.
+        """
+        code_hash = token_time.hash_secret(code)
+        sid = self._session_by_code(code_hash)
+        if sid is None:
+            return
+        async with self.lock_for(sid), self.store.mutate() as state:
+            stored = state.sessions.get(sid)
+            if stored is None or stored.code_hash != code_hash:
+                return
+            self._clear_code(stored)
+        logger.warning("code_rejected sid=%s error=invalid_request", sid[:8])
+
+    @staticmethod
+    def _clear_code(session: Session) -> None:
+        session.code_hash = None
+        session.code_expires_at = None
+        session.code_redirect_uri = None
+        session.code_challenge = None
+        session.code_resource = None
+
     def _session_by_code(self, code_hash: str) -> str | None:
         for session in self.store.snapshot().sessions.values():
             if session.code_hash is not None and hmac.compare_digest(
@@ -519,8 +545,13 @@ class SessionManager:
                 problem = GrantError("invalid_grant", "redirect_uri does not match")
             elif not self._pkce_ok(verifier, session.code_challenge):
                 problem = GrantError("invalid_grant", "code_verifier does not match")
-            elif not self._resource_ok(resource):
-                problem = GrantError("invalid_target", "resource is not this server")
+            elif not self._resource_ok(resource) or (
+                resource is not None
+                and session.code_resource is not None
+                and resource.removesuffix("/")
+                != session.code_resource.removesuffix("/")
+            ):
+                problem = GrantError("invalid_target", "resource does not match")
             response, refresh_token = (
                 self._token_response(session) if problem is None else ({}, "")
             )
@@ -528,11 +559,7 @@ class SessionManager:
                 stored = state.sessions.get(sid)
                 if stored is None:
                     raise GrantError("invalid_grant", "session ended")
-                stored.code_hash = None
-                stored.code_expires_at = None
-                stored.code_redirect_uri = None
-                stored.code_challenge = None
-                stored.code_resource = None
+                self._clear_code(stored)
                 if problem is None:
                     stored.code_redeemed = True
                     stored.refresh_hash = token_time.hash_secret(refresh_token)
@@ -610,6 +637,12 @@ class SessionManager:
         session = snap.sessions.get(sid)
         if session is None:
             raise self._refresh_rejected(sid, "session_ended")
+        if session.idp_refresh_started_at is not None:
+            # A previous IdP refresh has an unknown outcome (crash before its
+            # result was stored): the stored IdP token may be spent. Checked
+            # first, so not even a replay is served (fail closed).
+            await self.end_session_locked(sid, "idp_refresh_unknown")
+            raise self._refresh_rejected(sid, "idp_refresh_unknown")
         now = token_time.now()
         replay = session.replay
         if session.refresh_hash != token_hash:
@@ -633,11 +666,6 @@ class SessionManager:
         if now >= session.refresh_deadline:
             await self.end_session_locked(sid, "expired")
             raise self._refresh_rejected(sid, "expired")
-        if session.idp_refresh_started_at is not None:
-            # A previous IdP refresh has an unknown outcome (crash before its
-            # result was stored): the stored IdP token may be spent.
-            await self.end_session_locked(sid, "idp_refresh_unknown")
-            raise self._refresh_rejected(sid, "idp_refresh_unknown")
         link = snap.links.get(session.user_key)
         if link is None or session.idp_refresh_token is None:
             await self.end_session_locked(sid, "identity_missing", drop_grants=True)

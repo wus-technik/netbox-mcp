@@ -25,6 +25,8 @@ from tests.oauth.fakes import FakeIdP
 from tests.oauth.fakes import FakeNetBoxTokens
 from tests.oauth.test_flow import REDIRECT
 from tests.oauth.test_flow import VERIFIER
+from tests.oauth.test_flow import approve
+from tests.oauth.test_flow import callback_url
 from tests.oauth.test_flow import login_with_consent
 from tests.oauth.test_flow import qs
 from tests.oauth.test_flow import register
@@ -852,3 +854,70 @@ async def test_logs_events_without_secrets(http, fake_idp, store, caplog) -> Non
     ]
     for secret in secrets:
         assert secret not in text
+
+
+# ------------------------------------------------------------ fix round 1
+
+
+async def test_replay_refused_when_fail_closed_marker_set(
+    http, store, fake_idp
+) -> None:
+    _, a = await tokens_for(http, fake_idp)
+    rotated = await refresh(http, a["refresh_token"])
+    assert rotated.status_code == 200
+    async with store.mutate() as state:
+        (session,) = state.sessions.values()
+        session.idp_refresh_started_at = session.created_at
+    calls = (idp_refreshes(fake_idp), fake_idp.calls["userinfo"])
+    resp = await refresh(http, a["refresh_token"])  # within the replay window
+    assert_error(resp, 400, "invalid_grant")
+    assert store.snapshot().sessions == {}
+    assert len(store.snapshot().cleanup) == 1
+    assert (idp_refreshes(fake_idp), fake_idp.calls["userinfo"]) == calls
+
+
+@pytest.mark.parametrize("drop", ["client_id", "redirect_uri", "code_verifier"])
+async def test_malformed_code_request_burns_code(http, store, fake_idp, drop) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    if drop == "client_id":
+        resp = await exchange(http, None, code)
+    else:
+        resp = await exchange(http, client_id, code, **{drop: None})
+    assert_error(resp, 400, "invalid_request")
+    assert only_session(store).code_hash is None
+    assert_error(await exchange(http, client_id, code), 400, "invalid_grant")
+
+
+async def code_with_resource(http, fake_idp, resource: str) -> tuple[str, str]:
+    client_id = await register(http)
+    resp = await http.get(
+        await callback_url(http, fake_idp, client_id, resource=resource)
+    )
+    assert resp.status_code == 303, resp.text
+    resp = await approve(http, resp.headers["location"])
+    assert resp.status_code == 303, resp.text
+    return client_id, qs(resp.headers["location"])["code"]
+
+
+@pytest.mark.parametrize("sent", [None, PUBLIC, PUBLIC + "/"])
+async def test_code_resource_binding_accepts_same_resource(
+    http, fake_idp, sent
+) -> None:
+    client_id, code = await code_with_resource(http, fake_idp, PUBLIC)
+    resp = await exchange(http, client_id, code, resource=sent)
+    assert resp.status_code == 200, resp.text
+
+
+async def test_code_resource_binding_mismatch_invalid_target(
+    http, store, fake_idp
+) -> None:
+    client_id, code = await code_with_resource(http, fake_idp, PUBLIC)
+    # A code bound to another resource of ours (not reachable via /authorize
+    # today, which only accepts this server) must not redeem for this one.
+    async with store.mutate() as state:
+        (session,) = state.sessions.values()
+        session.code_resource = "https://mcp.example.com/other"
+    resp = await exchange(http, client_id, code, resource=PUBLIC)
+    assert_error(resp, 400, "invalid_target")
+    assert only_session(store).code_hash is None
+    assert_error(await exchange(http, client_id, code), 400, "invalid_grant")
