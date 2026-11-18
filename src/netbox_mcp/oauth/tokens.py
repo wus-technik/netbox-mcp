@@ -19,6 +19,8 @@ from joserfc import jwt
 from joserfc.errors import JoseError
 
 from netbox_mcp.oauth.config import OAuthConfig
+from netbox_mcp.oauth.state import CleanupEntry
+from netbox_mcp.oauth.state import OAuthState
 
 ACCESS_TOKEN_TTL = 3600
 SCOPE = "netbox"
@@ -27,6 +29,20 @@ SCOPE = "netbox"
 def now() -> float:
     """Current time in seconds; all expiry logic in this package uses it."""
     return time.time()
+
+
+def enqueue_cleanup(
+    state: OAuthState, token_id: int, user_id: int, reason: str
+) -> None:
+    """Queue a NetBox token for deletion (used by sessions and the admin CLI)."""
+    entry_id = uuid.uuid4().hex
+    state.cleanup[entry_id] = CleanupEntry(
+        entry_id=entry_id,
+        netbox_token_id=token_id,
+        netbox_user_id=user_id,
+        reason=reason,
+        created_at=now(),
+    )
 
 
 def new_secret() -> str:

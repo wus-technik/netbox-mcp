@@ -19,7 +19,6 @@ import asyncio
 import base64
 import binascii
 import sys
-import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,10 +29,10 @@ from urllib.parse import urlparse
 
 import httpx2
 
+from netbox_mcp.netbox_client import NetBoxAPIError
 from netbox_mcp.oauth import tokens as token_time
 from netbox_mcp.oauth.broker import BrokerError
 from netbox_mcp.oauth.broker import NetBoxBroker
-from netbox_mcp.oauth.state import CleanupEntry
 from netbox_mcp.oauth.state import OAuthState
 from netbox_mcp.oauth.store import KEY_BYTES
 from netbox_mcp.oauth.store import StateStore
@@ -110,22 +109,12 @@ def _open_store(settings: _StoreSettings) -> StateStore:
         raise _CliError(f"cannot open the state store: {exc}") from None
 
 
-def _enqueue(state: OAuthState, token_id: int, user_id: int, reason: str) -> None:
-    """Queue a token for deletion, exactly like ``SessionManager._enqueue``."""
-    entry_id = uuid.uuid4().hex
-    state.cleanup[entry_id] = CleanupEntry(
-        entry_id=entry_id,
-        netbox_token_id=token_id,
-        netbox_user_id=user_id,
-        reason=reason,
-        created_at=token_time.now(),
-    )
-
-
 def _end_sessions(state: OAuthState, sids: list[str], reason: str) -> int:
     for sid in sids:
         session = state.sessions.pop(sid)
-        _enqueue(state, session.netbox_token_id, session.netbox_user_id, reason)
+        token_time.enqueue_cleanup(
+            state, session.netbox_token_id, session.netbox_user_id, reason
+        )
     return len(sids)
 
 
@@ -166,17 +155,20 @@ def _cmd_unlink(args: list[str], out: TextIO) -> int:
     wanted = args[0].casefold()
     settings = _store_settings()
 
+    def matching(state: OAuthState) -> set[str]:
+        # Offline and store-only: the username recorded in the link, compared
+        # casefolded like the denylist. No NetBox lookup is made.
+        return {
+            k
+            for k, link in state.links.items()
+            if link.netbox_username.casefold() == wanted
+        }
+
     async def work(store: StateStore) -> tuple[int, int]:
+        if not matching(store.snapshot()):
+            return 0, 0  # nothing to change: do not rewrite the file
         async with store.mutate() as state:
-            # Offline and store-only: the username recorded in the link, compared
-            # casefolded like the denylist. No NetBox lookup is made.
-            keys = {
-                k
-                for k, link in state.links.items()
-                if link.netbox_username.casefold() == wanted
-            }
-            if not keys:
-                return 0, 0
+            keys = matching(state)
             for key in keys:
                 del state.links[key]
             sids = [s.sid for s in state.sessions.values() if s.user_key in keys]
@@ -268,6 +260,11 @@ def _cmd_sweep(
             ]
         except BrokerError as exc:
             raise _CliError(f"cannot list NetBox tokens: {exc}") from None
+        except NetBoxAPIError as exc:
+            # Status only: the response body is never shown.
+            raise _CliError(
+                f"cannot list NetBox tokens: NetBox answered HTTP {exc.status}"
+            ) from None
         untracked = [
             t
             for t in listed
@@ -280,7 +277,7 @@ def _cmd_sweep(
                 try:
                     await broker.delete_token(token.id)
                     deleted += 1
-                except BrokerError:
+                except (BrokerError, NetBoxAPIError):
                     failed += 1
         return {
             "listed": len(listed),

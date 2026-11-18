@@ -28,7 +28,6 @@ from netbox_mcp.oauth.idp import IdpClient
 from netbox_mcp.oauth.idp import IdpLogin
 from netbox_mcp.oauth.idp import IdpRejected
 from netbox_mcp.oauth.idp import IdpUnavailable
-from netbox_mcp.oauth.state import CleanupEntry
 from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.state import Link
 from netbox_mcp.oauth.state import OAuthState
@@ -280,14 +279,7 @@ class SessionManager:
 
     @staticmethod
     def _enqueue(state: OAuthState, token_id: int, user_id: int, reason: str) -> None:
-        entry_id = uuid.uuid4().hex
-        state.cleanup[entry_id] = CleanupEntry(
-            entry_id=entry_id,
-            netbox_token_id=token_id,
-            netbox_user_id=user_id,
-            reason=reason,
-            created_at=token_time.now(),
-        )
+        token_time.enqueue_cleanup(state, token_id, user_id, reason)
 
     async def _drop_marker(self, nonce: str) -> None:
         """Best effort: a marker left behind is cleaned up by recovery."""

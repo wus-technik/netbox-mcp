@@ -224,10 +224,11 @@ class StateStore:
         """Write an empty state file; never overwrites an existing file."""
         _check_key(key)
         path = Path(path)
-        if path.exists():
-            raise StoreError(f"state file already exists: {path}")
+        # Lock first: a running server must answer StoreLocked, not "exists".
         lock_fd = _acquire_lock(path)
         try:
+            if path.exists():
+                raise StoreError(f"state file already exists: {path}")
             _write_atomic(path, _encrypt(OAuthState(), key), overwrite=False)
         except FileExistsError:
             raise StoreError(f"state file already exists: {path}") from None

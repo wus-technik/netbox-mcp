@@ -189,11 +189,11 @@ def test_unlink_removes_link_ends_sessions_enqueues_tokens(populated: Path) -> N
 
 
 def test_unlink_unknown_user_changes_nothing(populated: Path) -> None:
-    before = load(populated)
+    before = populated.read_bytes()
     code, _, err = run("unlink", "nobody")
     assert code == 1
     assert "no identity link" in err
-    assert load(populated) == before
+    assert populated.read_bytes() == before
 
 
 def test_unlink_needs_one_argument(populated: Path) -> None:  # noqa: ARG001
@@ -222,23 +222,23 @@ def netbox(populated: Path, monkeypatch: pytest.MonkeyPatch) -> FakeNetBoxTokens
     monkeypatch.setenv("NETBOX_URL", FakeNetBoxTokens.base_url)
     monkeypatch.setenv("NETBOX_TOKEN_BROKER_TOKEN", "nbt_broker.secret")
     fake = FakeNetBoxTokens()
-    # IDs 1..5: held by a session (1, 2), carrying a marker nonce (3),
-    # untracked (4), and a foreign token without the prefix (5).
+    # IDs 1..6: held by a session (1, 2), carrying a marker nonce (3), on the
+    # cleanup queue (4), foreign without the prefix (5), untracked (6).
     fake.add_token("alice", description=PREFIX + "C s-alice1 aaaa")
     fake.add_token("bob", description=PREFIX + "C s-bob0001 bbbb")
     fake.add_token("alice", description=PREFIX + "C s-xxxxxxx n1")
-    fake.add_token("bob", description=PREFIX + "C s-gone0000 gggg")
+    fake.add_token("bob", description=PREFIX + "C s-queued00 qqqq")
     fake.add_token("bob", description="my own token")
+    fake.add_token("bob", description=PREFIX + "C s-gone0000 gggg")
     state_store = StateStore.open(populated, KEY)
 
     async def track() -> None:
         async with state_store.mutate() as state:
             state.sessions["s-alice"].netbox_token_id = 1
             state.sessions["s-bob"].netbox_token_id = 2
-            # Token 4 is on the cleanup queue; 3 is tracked by the marker.
             state.cleanup["e1"] = CleanupEntry(
                 entry_id="e1",
-                netbox_token_id=99,
+                netbox_token_id=4,
                 netbox_user_id=1,
                 reason="x",
                 created_at=1,
@@ -255,7 +255,7 @@ def test_sweep_dry_run_deletes_nothing(
 ) -> None:
     code, out, _ = run("sweep", transport=netbox.transport)
     assert code == 0
-    assert set(netbox.tokens) == {1, 2, 3, 4, 5}
+    assert set(netbox.tokens) == {1, 2, 3, 4, 5, 6}
     assert not netbox.sent("DELETE")
     assert "untracked: 1" in out
     assert "Dry run" in out
@@ -269,7 +269,7 @@ def test_sweep_apply_deletes_only_untracked(
 ) -> None:
     code, out, _ = run("sweep", "--apply", transport=netbox.transport)
     assert code == 0
-    assert set(netbox.tokens) == {1, 2, 3, 5}
+    assert set(netbox.tokens) == {1, 2, 3, 4, 5}
     assert "Deleted 1" in out
 
 
@@ -295,7 +295,7 @@ def test_sweep_netbox_failure_is_exit_1(
     code, _, err = run("sweep", "--apply", transport=netbox.transport)
     assert code == 1
     assert "cannot list" in err
-    assert set(netbox.tokens) == {1, 2, 3, 4, 5}
+    assert set(netbox.tokens) == {1, 2, 3, 4, 5, 6}
 
 
 def test_sweep_unknown_flag(populated: Path) -> None:  # noqa: ARG001
@@ -320,3 +320,66 @@ def test_main_dispatches_oauth_before_any_server_checks(
         server.main()
     assert exc.value.code == 0
     assert state_path.is_file()
+
+
+def test_sweep_apply_keeps_session_queued_and_marker_tokens(
+    netbox: FakeNetBoxTokens,
+) -> None:
+    code, _, _ = run("sweep", "--apply", transport=netbox.transport)
+    assert code == 0
+    # session (1, 2), marker nonce (3), cleanup queue (4), foreign (5) survive.
+    assert {1, 2, 3, 4, 5} <= set(netbox.tokens)
+    assert 6 not in netbox.tokens
+    assert [r.method for r in netbox.sent("DELETE")] == ["DELETE"]
+
+
+def test_sweep_api_error_is_sanitized_exit_1(netbox: FakeNetBoxTokens) -> None:
+    netbox.fail("tokens.list", 404)
+    code, out, err = run("sweep", transport=netbox.transport)
+    assert code == 1
+    assert "HTTP 404" in err
+    assert "Traceback" not in err + out
+
+
+def test_init_while_locked_exits_2(state_path: Path) -> None:
+    StateStore.create(state_path, KEY)
+    holder = StateStore.open(state_path, KEY)
+    try:
+        code, _, err = run("init")
+    finally:
+        holder.close()
+    assert code == 2
+    assert "locked" in err
+
+
+def test_entry_point_oauth_works_with_partial_env(
+    tmp_path: Path,
+) -> None:
+    import os
+    import subprocess
+    import sys
+
+    path = tmp_path / "s.bin"
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("MCP_", "OIDC_", "OAUTH_", "NETBOX_"))
+    }
+    env.update(
+        OIDC_ISSUER="https://idp.example.com",
+        OAUTH_STATE_PATH=str(path),
+        OAUTH_STATE_KEY=base64.b64encode(KEY).decode(),
+        PYTHONUTF8="1",
+    )
+    proc = subprocess.run(
+        [sys.executable, "-m", "netbox_mcp.cli_entry", "oauth", "init"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert path.is_file()
+    assert "netbox_mcp.server" not in proc.stderr
