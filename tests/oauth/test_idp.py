@@ -385,3 +385,139 @@ async def test_no_redirect_following(oauth_config, fake_idp) -> None:
     assert [r.path for r in fake_idp.requests_to("token")] == [
         "/application/o/test/token/"
     ]
+
+
+# -- hardening (review fix round 1)
+
+
+def _set_jwks(monkeypatch, doc):
+    monkeypatch.setattr(FakeIdP, "jwks", property(lambda _self: doc))
+
+
+def _custom_token(idp: FakeIdP, nonce: str = "n-1", **overrides):
+    from joserfc import jwt as jose_jwt
+
+    from tests.oauth.fakes import _rsa_key
+
+    def build(username, _nonce):
+        now = int(idp.now())
+        claims = {
+            "iss": idp.issuer,
+            "aud": idp.client_id,
+            "sub": idp.users[username]["sub"],
+            "preferred_username": username,
+            "iat": now,
+            "exp": now + 3600,
+            "nonce": nonce,
+            **overrides,
+        }
+        claims = {k: v for k, v in claims.items() if v is not ...}
+        return jose_jwt.encode({"alg": "RS256", "kid": "test-key"}, claims, _rsa_key())
+
+    idp._id_token = build
+
+
+@pytest.mark.parametrize(
+    ("overrides", "ok"),
+    [
+        ({"aud": ["netbox-mcp", "other"]}, False),
+        ({"aud": ["netbox-mcp", "other"], "azp": "netbox-mcp"}, True),
+        ({"aud": ["netbox-mcp", "other"], "azp": "other"}, False),
+        ({"azp": "other"}, False),
+        ({"azp": "netbox-mcp"}, True),
+        ({"iat": "yesterday"}, False),
+        ({"iat": None}, False),
+        ({"iat": ...}, True),
+    ],
+)
+async def test_id_token_azp_and_iat(oauth_config, fake_idp, overrides, ok) -> None:
+    client, code = await _logged_in(oauth_config, fake_idp)
+    _custom_token(fake_idp, **overrides)
+    if ok:
+        assert (await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")).sub
+    else:
+        with pytest.raises(IdpRejected):
+            await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")
+
+
+@pytest.mark.parametrize("exp", ["soon", None, float("inf"), True])
+async def test_id_token_bad_exp_rejected(oauth_config, fake_idp, exp) -> None:
+    client, code = await _logged_in(oauth_config, fake_idp)
+    _custom_token(fake_idp, exp=exp)
+    with pytest.raises(IdpRejected):
+        await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")
+
+
+async def test_unknown_kid_after_refetch_is_unavailable(
+    oauth_config, fake_idp, monkeypatch
+):
+    client, code = await _logged_in(oauth_config, fake_idp)
+    _set_jwks(monkeypatch, {"keys": []})
+    with pytest.raises(IdpUnavailable):
+        await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")
+
+
+@pytest.mark.parametrize("extra", [{"alg": "RS512"}, {"use": "enc"}])
+async def test_unusable_jwk_is_unavailable(
+    oauth_config, fake_idp, extra, monkeypatch
+) -> None:
+    client, code = await _logged_in(oauth_config, fake_idp)
+    keys = fake_idp.jwks
+    _set_jwks(monkeypatch, {"keys": [{**keys["keys"][0], **extra}]})
+    with pytest.raises(IdpUnavailable):
+        await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")
+
+
+async def test_jwk_with_matching_alg_and_use_accepted(
+    oauth_config, fake_idp, monkeypatch
+) -> None:
+    client, code = await _logged_in(oauth_config, fake_idp)
+    keys = fake_idp.jwks
+    _set_jwks(
+        monkeypatch, {"keys": [{**keys["keys"][0], "alg": "RS256", "use": "sig"}]}
+    )
+    assert (await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")).sub
+
+
+@pytest.mark.parametrize("bad", ["https://", "https://[bad", "not a url", ""])
+async def test_discovery_malformed_url_is_unavailable(oauth_config, bad) -> None:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        i = oauth_config.issuer_url
+        return httpx2.Response(
+            200,
+            json={
+                "issuer": i,
+                "authorization_endpoint": f"{i}authorize/",
+                "token_endpoint": bad,
+                "userinfo_endpoint": f"{i}userinfo/",
+                "jwks_uri": f"{i}jwks/",
+            },
+        )
+
+    client = IdpClient(oauth_config, transport=httpx2.MockTransport(handler))
+    with pytest.raises(IdpUnavailable):
+        await client.discover()
+
+
+async def test_unknown_kid_refetch_rate_limited(
+    oauth_config, fake_idp, clock, monkeypatch
+):
+    client, code = await _logged_in(oauth_config, fake_idp)
+    keys = fake_idp.jwks
+    _set_jwks(monkeypatch, {"keys": []})
+    client._jwks = {"x": {"kid": "x"}}
+    client._jwks_fetched = fake_idp.now()
+    with pytest.raises(IdpUnavailable):
+        await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")
+    assert fake_idp.calls["jwks"] == 1
+    # Within 60 s: no further fetch.
+    code2 = await _login_code(fake_idp, client)
+    with pytest.raises(IdpUnavailable):
+        await client.exchange_code(code2, VERIFIER, REDIRECT, "n-1")
+    assert fake_idp.calls["jwks"] == 1
+    # After the window a forced refetch is allowed again and finds the key.
+    clock.advance(61)
+    _set_jwks(monkeypatch, keys)
+    code3 = await _login_code(fake_idp, client)
+    assert (await client.exchange_code(code3, VERIFIER, REDIRECT, "n-1")).sub
+    assert fake_idp.calls["jwks"] == 2

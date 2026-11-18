@@ -14,6 +14,7 @@ Redirects are never followed. Tokens and codes are never logged.
 import base64
 import hashlib
 import hmac
+import math
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlencode
@@ -29,6 +30,8 @@ BASE_SCOPES = ("openid", "profile", "email", "offline_access")
 JWKS_TTL = 300
 # Clock skew tolerated between this server and the IdP for exp/iat.
 LEEWAY = 60
+# Minimum seconds between forced JWKS refetches triggered by an unknown kid.
+JWKS_FORCED_REFETCH_INTERVAL = 60
 HTTP_TIMEOUT = httpx2.Timeout(10.0)
 
 
@@ -68,6 +71,14 @@ def pkce_challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
+def _not_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+    )
+
+
 def _nonempty_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -85,6 +96,7 @@ class IdpClient:
         self._endpoints: dict[str, str] | None = None
         self._jwks: dict[str, Any] | None = None
         self._jwks_fetched = 0.0
+        self._jwks_forced_at: float | None = None
 
     # -- HTTP plumbing
 
@@ -152,8 +164,13 @@ class IdpClient:
             "jwks_uri",
         ):
             value = _nonempty_str(doc.get(key))
-            if value is None or urlsplit(value).scheme != "https":
-                raise IdpUnavailable(f"discovery: {key} missing or not https")
+            try:
+                parts = urlsplit(value) if value else None
+                valid = parts is not None and parts.scheme == "https" and parts.hostname
+            except ValueError:
+                valid = False
+            if value is None or not valid:
+                raise IdpUnavailable(f"discovery: {key} missing or not a https URL")
             found[key] = value
         self._endpoints = found
 
@@ -248,14 +265,21 @@ class IdpClient:
     async def _signing_key(self, kid: str) -> Any:
         keys = await self._jwks_keys()
         if kid not in keys:
-            keys = await self._jwks_keys(force=True)  # key rotation: refetch once
+            current = tokens.now()
+            last = self._jwks_forced_at
+            if last is not None and current - last < JWKS_FORCED_REFETCH_INTERVAL:
+                raise IdpUnavailable("jwks: unknown kid, refetch rate-limited")
+            self._jwks_forced_at = current  # key rotation: refetch at most 1/min
+            keys = await self._jwks_keys(force=True)
         jwk = keys.get(kid)
         if jwk is None:
-            raise IdpRejected("id_token signed with an unknown key")
+            raise IdpUnavailable("jwks: kid not found")
+        if jwk.get("alg", "RS256") != "RS256" or jwk.get("use", "sig") != "sig":
+            raise IdpUnavailable("jwks: key not usable for RS256 signatures")
         try:
             return jwt.PyJWK(jwk).key
         except jwt.PyJWTError:
-            raise IdpRejected("id_token key is unusable") from None
+            raise IdpUnavailable("jwks: key is unusable") from None
 
     async def _validate_id_token(self, id_token: str, nonce: str) -> dict[str, Any]:
         try:
@@ -285,17 +309,21 @@ class IdpClient:
             raise IdpRejected("id_token validation failed") from None
         current = tokens.now()
         exp = claims["exp"]
-        if isinstance(exp, bool) or not isinstance(exp, int | float):
-            raise IdpRejected("id_token exp is not a number")
+        if _not_finite_number(exp):
+            raise IdpRejected("id_token exp is not a finite number")
         if exp + LEEWAY <= current:
             raise IdpRejected("id_token expired")
-        iat = claims.get("iat")
-        if (
-            isinstance(iat, int | float)
-            and not isinstance(iat, bool)
-            and iat - LEEWAY > current
-        ):
-            raise IdpRejected("id_token issued in the future")
+        if "iat" in claims:
+            iat = claims["iat"]
+            if _not_finite_number(iat):
+                raise IdpRejected("id_token iat is not a finite number")
+            if iat - LEEWAY > current:
+                raise IdpRejected("id_token issued in the future")
+        audience = claims["aud"]
+        azp = claims.get("azp")
+        multiple = isinstance(audience, list) and len(audience) > 1
+        if (multiple or azp is not None) and azp != self.config.client_id:
+            raise IdpRejected("id_token azp does not match the client")
         got = claims.get("nonce")
         if not isinstance(got, str) or not hmac.compare_digest(got, nonce):
             raise IdpRejected("id_token nonce mismatch")
