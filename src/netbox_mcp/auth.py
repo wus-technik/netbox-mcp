@@ -329,11 +329,14 @@ def rate_limit_client_id(_context: object) -> str:
     transports such as stdio share one ``"global"`` window, as before.
     """
     access_token = get_access_token()
-    if access_token is None or not access_token.token:
+    if access_token is None:
         return "global"
     claims = access_token.claims or {}
+    # An OAuth session ended on use has an empty token but still a user.
     if claims.get("netbox_mcp_auth_mode") == OAUTH_AUTH_MODE:
         return f"oauth:{claims['sub']}"
+    if not access_token.token:
+        return "global"
     return access_token.client_id
 
 

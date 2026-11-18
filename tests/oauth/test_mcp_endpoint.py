@@ -462,6 +462,13 @@ async def test_token_gone_in_netbox_while_renewal_due_ends_session(env, clock, c
     # Spec 6.3: the call fails with "reconnect", no replacement token is made.
     assert is_tool_error(resp)
     assert "reconnect" in resp.json()["result"]["content"][0]["text"]
+    # No request with the ended session's token reaches NetBox's data endpoints.
+    assert dcim_requests(e) == []
+    assert not [
+        r
+        for r in e.tool_requests
+        if r.headers.get("authorization") == f"Bearer {old.netbox_token}"
+    ]
     assert len(e.netbox.sent("POST", "tokens.create")) == created
     state = e.manager.store.snapshot()
     assert state.sessions == {}

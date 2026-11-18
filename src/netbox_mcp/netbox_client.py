@@ -120,6 +120,10 @@ def set_oauth_sessions(sessions: OAuthSessions | None) -> None:
     _oauth_sessions = sessions
 
 
+# Claim the OAuth verifier sets when it ended the session while checking the
+# request: the AccessToken then carries no NetBox token (spec 6.3).
+SESSION_ENDED_CLAIM = "netbox_mcp_session_ended"
+
 # Statuses NetBox answers when it does not accept the token.
 TOKEN_REJECTED = frozenset({401, 403})
 SESSION_ENDED_MESSAGE = (
@@ -248,6 +252,8 @@ class NetBoxClient:
         Raises:
             MissingTokenError: If an explicit token is empty, or passthrough is
                 on and the request has no token.
+            OAuthSessionError: The OAuth session ended while the request was
+                checked.
         """
         self._oauth = None
         if self._token is not None:
@@ -260,6 +266,10 @@ class NetBoxClient:
             and access_token.claims.get("netbox_mcp_auth_mode") == "oauth"
         ):
             claims = access_token.claims
+            if claims.get(SESSION_ENDED_CLAIM):
+                # Ended while this request was checked: fail without asking
+                # NetBox anything with the session's token.
+                raise OAuthSessionError(SESSION_ENDED_MESSAGE)
             # OAuth mode: the session's own NetBox token, put there by the
             # verifier. Only this path reports NetBox rejections to the
             # session manager; an explicit ``token`` (the broker) never does.

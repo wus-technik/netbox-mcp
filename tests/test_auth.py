@@ -986,3 +986,33 @@ def test_verifier_refuses_to_start_without_its_error_handler(
 
     with pytest.raises(RuntimeError, match="auth middleware changed"):
         verifier.get_middleware()
+
+
+def oauth_access_token(**extra) -> AccessToken:
+    return AccessToken(
+        token=extra.pop("token", ""),
+        client_id="c",
+        scopes=[],
+        claims={"netbox_mcp_auth_mode": "oauth", "sub": "u1", "sid": "s1", **extra},
+    )
+
+
+async def test_resolve_token_fails_without_netbox_when_session_ended(
+    config, netbox, monkeypatch
+):
+    access = oauth_access_token(netbox_mcp_session_ended=True)
+    monkeypatch.setattr(netbox_client, "get_access_token", lambda: access)
+
+    with pytest.raises(netbox_client.OAuthSessionError) as exc:
+        async with NetBoxClient(config, transport=netbox.transport):
+            pass
+
+    assert str(exc.value) == netbox_client.SESSION_ENDED_MESSAGE
+    assert netbox.sent("GET") == []
+
+
+async def test_rate_limit_keeps_oauth_user_when_session_ended(monkeypatch):
+    access = oauth_access_token(netbox_mcp_session_ended=True)
+    monkeypatch.setattr(auth, "get_access_token", lambda: access)
+
+    assert rate_limit_client_id(None) == "oauth:u1"

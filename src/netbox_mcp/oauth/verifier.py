@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.auth.auth import TokenVerifier
 
+from netbox_mcp.netbox_client import SESSION_ENDED_CLAIM
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.store import StoreError
 from netbox_mcp.oauth.tokens import SCOPE
@@ -92,6 +93,7 @@ class OAuthTokenVerifier(TokenVerifier):
         ):
             return None
         current = manager.current_token(sid)
+        ended = False
         if current is not None and manager.renewal_due(sid):
             try:
                 ended = await manager.renew_if_due(sid)
@@ -102,12 +104,26 @@ class OAuthTokenVerifier(TokenVerifier):
             if not ended:
                 current = manager.current_token(sid)
             # Otherwise NetBox has just confirmed that this token is deleted or
-            # disabled and the session is ended. The call goes ahead with it,
-            # NetBox rejects it and the client gets the "reconnect" tool error
-            # of spec 6.3; the next request is answered 401.
+            # disabled and the session is ended. The dead bearer is not handed
+            # on: the token is empty and flagged, the NetBox client fails the
+            # call with the "reconnect" tool error of spec 6.3 without a
+            # request to NetBox, and the next request is answered 401.
         if current is None:
             return None
         bearer, version = current
+        if ended:
+            return AccessToken(
+                token="",
+                client_id=session.client_id,
+                scopes=[SCOPE],
+                expires_at=int(claims["exp"]),
+                claims={
+                    "netbox_mcp_auth_mode": OAUTH_AUTH_MODE,
+                    SESSION_ENDED_CLAIM: True,
+                    "sub": session.user_key,
+                    "sid": sid,
+                },
+            )
         return AccessToken(
             token=bearer,
             client_id=session.client_id,
