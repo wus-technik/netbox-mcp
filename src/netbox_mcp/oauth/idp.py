@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import math
 from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
 from urllib.parse import urlencode
 from urllib.parse import urlsplit
@@ -56,14 +57,14 @@ class IdpLogin:
     sub: str
     username: str
     groups: list[str]
-    refresh_token: str
+    refresh_token: str = field(repr=False)
 
 
 @dataclass(frozen=True)
 class IdpTokens:
-    access_token: str
+    access_token: str = field(repr=False)
     # None when the IdP did not rotate; the caller keeps its old refresh token.
-    refresh_token: str | None
+    refresh_token: str | None = field(repr=False)
 
 
 def pkce_challenge(verifier: str) -> str:

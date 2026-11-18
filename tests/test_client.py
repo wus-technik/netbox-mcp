@@ -172,6 +172,18 @@ async def test_method_preserving_redirect_keeps_the_write(config):
         assert await nb.post("dcim/sites", {"name": "x"}) == {"method": "POST"}
 
 
+async def test_redirect_warning_logs_no_query_string(config, caplog, monkeypatch):
+    monkeypatch.setattr(NetBoxClient, "_redirect_warned", set())
+    config.netbox_url = "http://netbox.test"
+    async with NetBoxClient(config, transport=_redirecting_transport(301)) as nb:
+        with caplog.at_level("WARNING", logger="netbox_mcp.netbox_client"):
+            await nb.get("users/tokens", params={"description__ic": "nonce-42"})
+    assert "NetBox redirects http://netbox.test/api/users/tokens/" in caplog.text
+    assert "https://netbox.test/api/users/tokens/" in caplog.text
+    assert "nonce-42" not in caplog.text
+    assert "description__ic" not in caplog.text
+
+
 def _slow_transport() -> httpx2.MockTransport:
     async def handler(_request: httpx2.Request) -> httpx2.Response:
         await asyncio.sleep(1)

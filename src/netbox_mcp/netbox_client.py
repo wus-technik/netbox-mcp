@@ -448,7 +448,8 @@ class NetBoxClient:
         Raises:
             ValueError: If the method changed along the redirect chain.
         """
-        final_url = response.request.url
+        # Without the query: it can carry filters such as usernames or nonces.
+        final_url = response.request.url.copy_with(query=None)
         if response.request.method != method:
             raise ValueError(
                 f"{method} {path} was redirected to {final_url} and turned into a "
@@ -460,7 +461,7 @@ class NetBoxClient:
             logger.warning(
                 "NetBox redirects %s to %s - set NETBOX_URL to the final address "
                 "to avoid an extra round trip on every call.",
-                response.history[0].request.url,
+                response.history[0].request.url.copy_with(query=None),
                 final_url,
             )
 

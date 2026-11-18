@@ -4,11 +4,17 @@ All timestamps are epoch seconds (``float``). Dicts are keyed by the ID named
 in each model's docstring.
 """
 
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+
+
+def _secret(default: object = ...) -> Any:
+    """Field kept out of ``repr``: tokens, codes, nonces and their hashes."""
+    return Field(default, repr=False)
 
 
 class _Model(BaseModel):
@@ -41,16 +47,16 @@ class Flow(_Model):
     flow_id: str
     client_id: str
     redirect_uri: str
-    state: str | None = None
+    state: str | None = _secret(None)
     code_challenge: str
     resource: str | None = None
-    idp_state: str
-    idp_nonce: str
-    idp_verifier: str
+    idp_state: str = _secret()
+    idp_nonce: str = _secret()
+    idp_verifier: str = _secret()
     created_at: float
     claimed: bool = False
     user_key: str | None = None
-    idp_refresh_token: str | None = None
+    idp_refresh_token: str | None = _secret(None)
 
 
 class Link(_Model):
@@ -67,9 +73,9 @@ class Link(_Model):
 class Replay(_Model):
     """Replay slot of the last refresh rotation."""
 
-    hash: str
+    hash: str = _secret()
     rotated_at: float
-    response: dict
+    response: dict = _secret()
 
 
 class Session(_Model):
@@ -80,23 +86,23 @@ class Session(_Model):
     client_id: str
     netbox_user_id: int
     created_at: float
-    code_hash: str | None = None
+    code_hash: str | None = _secret(None)
     code_expires_at: float | None = None
     code_redeemed: bool = False
     # Bindings of the authorization code (spec 5.4), checked at redemption.
     code_redirect_uri: str | None = None
     code_challenge: str | None = None
     code_resource: str | None = None
-    refresh_hash: str | None = None
-    spent_hashes: list[str] = Field(default_factory=list)
-    replay: Replay | None = None
+    refresh_hash: str | None = _secret(None)
+    spent_hashes: list[str] = Field(default_factory=list, repr=False)
+    replay: Replay | None = _secret(None)
     refresh_deadline: float
-    idp_refresh_token: str | None = None
+    idp_refresh_token: str | None = _secret(None)
     # Set before an IdP refresh starts; a leftover value after a crash means the
     # refresh outcome is unknown, so the session fails closed.
     idp_refresh_started_at: float | None = None
     last_idp_check_at: float
-    netbox_token: str
+    netbox_token: str = _secret()
     netbox_token_id: int
     netbox_token_expires_at: float | None = None
     token_version: int = 1
@@ -105,7 +111,7 @@ class Session(_Model):
 class PendingCreate(_Model):
     """Marker for a NetBox token being created, keyed by ``nonce``."""
 
-    nonce: str
+    nonce: str = _secret()
     netbox_user_id: int
     sid: str
     created_at: float
