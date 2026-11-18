@@ -1,6 +1,6 @@
-"""Registration, authorization, IdP callback and consent endpoints.
+"""Registration, authorization, IdP callback, consent, token and revocation.
 
-Spec sections 5.2 and 5.3. The IdP is reached through ``manager.idp`` (the
+Spec sections 5.2 to 5.5. The IdP is reached through ``manager.idp`` (the
 ``IdpClient`` the ``SessionManager`` was built with), so the routes and the
 session lifecycle always talk to the same, already discovered client.
 
@@ -18,7 +18,11 @@ A login flow goes through these phases, all kept in ``OAuthState.flows``:
    grant on approval and creates the session.
 
 Every terminal outcome deletes the flow, so a later ``/authorize`` starts from
-a clean slate. Token and revocation endpoints are added by a later task.
+a clean slate.
+
+``/token`` and ``/revoke`` are thin: they parse the form or JSON body and call
+``SessionManager.redeem_code``, ``refresh`` and ``revoke``, which hold the
+per-session lock and persist before a response is built.
 """
 
 import base64
@@ -50,6 +54,8 @@ from netbox_mcp.oauth.idp import IdpRejected
 from netbox_mcp.oauth.idp import IdpUnavailable
 from netbox_mcp.oauth.redirects import matches_registered
 from netbox_mcp.oauth.redirects import validate_registered_uri
+from netbox_mcp.oauth.sessions import GrantError
+from netbox_mcp.oauth.sessions import GrantUnavailable
 from netbox_mcp.oauth.sessions import LoginDenied
 from netbox_mcp.oauth.sessions import LoginFailed
 from netbox_mcp.oauth.sessions import SessionManager
@@ -72,6 +78,7 @@ REGISTER_LIMIT = 10
 REGISTER_WINDOW = 60.0
 MAX_REGISTER_BODY = 64 * 1024
 MAX_FORM_BODY = 4 * 1024
+MAX_TOKEN_BODY = 16 * 1024
 _RATE_KEYS_MAX = 10_000
 GRANT_TYPES = ["authorization_code", "refresh_token"]
 RESPONSE_TYPES = ["code"]
@@ -192,12 +199,57 @@ def _error_page(status: int, error: str, message: str) -> Response:
     return _page("Sign-in failed", body, status)
 
 
+NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
 def _json_error(status: int, error: str, description: str) -> Response:
     return JSONResponse(
         {"error": error, "error_description": description},
         status_code=status,
-        headers={"Cache-Control": "no-store"},
+        headers=NO_STORE,
     )
+
+
+class _BadRequest(Exception):  # noqa: N818 - internal control flow
+    """The token or revocation request body is unusable."""
+
+
+async def _oauth_params(request: Request) -> dict[str, str]:
+    """Parameters of a token/revocation request: form (RFC 6749) or JSON.
+
+    Only string values are accepted. ``client_secret`` and HTTP Basic
+    credentials are ignored: all clients are public.
+
+    Raises:
+        _BadRequest: Body too large, not parseable, or a non-string value.
+    """
+    raw = await _read_body(request, MAX_TOKEN_BODY)
+    if raw is None:
+        raise _BadRequest("request too large")
+    content_type = request.headers.get("content-type", "").split(";")[0].strip()
+    if content_type.lower() == "application/json":
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            raise _BadRequest("body is not JSON") from None
+        if not isinstance(body, dict):
+            raise _BadRequest("body is not a JSON object")
+        params: dict[str, str] = {}
+        for key, value in body.items():
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise _BadRequest(f"{key} must be a string")
+            params[key] = value
+        return params
+    try:
+        form = parse_qs(raw.decode("utf-8"), strict_parsing=False)
+    except UnicodeDecodeError:
+        raise _BadRequest("body is not UTF-8") from None
+    for key, values in form.items():
+        if len(values) > 1:
+            raise _BadRequest(f"{key} given more than once")
+    return {key: values[0] for key, values in form.items()}
 
 
 Handler = Callable[[Request], Awaitable[Response]]
@@ -706,12 +758,88 @@ class OAuthEndpoints:
         )
         return self._to_client(flow, {"code": code}, status)
 
+    # ------------------------------------------------------------ /token
+
+    async def token(self, request: Request) -> Response:
+        try:
+            params = await _oauth_params(request)
+        except _BadRequest as exc:
+            return _json_error(400, "invalid_request", str(exc))
+        grant_type = params.get("grant_type")
+        try:
+            if grant_type == "authorization_code":
+                missing = [
+                    name
+                    for name in ("code", "client_id", "redirect_uri", "code_verifier")
+                    if not params.get(name)
+                ]
+                if missing:
+                    return _json_error(
+                        400, "invalid_request", f"missing {', '.join(missing)}"
+                    )
+                body = await self.manager.redeem_code(
+                    params["code"],
+                    params["client_id"],
+                    params["redirect_uri"],
+                    params["code_verifier"],
+                    params.get("resource"),
+                )
+            elif grant_type == "refresh_token":
+                if not params.get("refresh_token"):
+                    return _json_error(400, "invalid_request", "missing refresh_token")
+                body = await self.manager.refresh(
+                    params["refresh_token"],
+                    params.get("client_id"),
+                    params.get("resource"),
+                )
+            elif not grant_type:
+                return _json_error(400, "invalid_request", "missing grant_type")
+            else:
+                return _json_error(
+                    400, "unsupported_grant_type", "grant type is not supported"
+                )
+        except GrantError as exc:
+            return _json_error(400, exc.error, exc.description)
+        except GrantUnavailable as exc:
+            return _json_error(503, "temporarily_unavailable", str(exc))
+        except StoreWriteError:
+            return _json_error(
+                503, "temporarily_unavailable", "the token could not be stored"
+            )
+        return JSONResponse(body, headers=NO_STORE)
+
+    # ----------------------------------------------------------- /revoke
+
+    async def revoke(self, request: Request) -> Response:
+        try:
+            params = await _oauth_params(request)
+        except _BadRequest as exc:
+            return _json_error(400, "invalid_request", str(exc))
+        token = params.get("token")
+        if not token:
+            return _json_error(400, "invalid_request", "missing token")
+        try:
+            await self.manager.revoke(token, params.get("client_id"))
+        except StoreWriteError:
+            return _json_error(
+                503, "temporarily_unavailable", "the revocation could not be stored"
+            )
+        return Response(status_code=200, headers=NO_STORE)
+
+
+# Root aliases with real handlers (spec 5.1): Claude Code builds origin + path.
+_ROOT_ALIASES = {
+    "register": ("/register",),
+    "authorize": ("/authorize",),
+    "token": ("/token",),
+    "revoke": ("/revoke", "/oauth/revoke"),
+}
+
 
 def oauth_routes(config: OAuthConfig, manager: SessionManager) -> list[Route]:
     """Routes under ``<base>/oauth/`` plus the root aliases with the same handlers.
 
-    The root aliases reuse the very handler objects (spec 5.1). The token and
-    revocation endpoints are added here by a later task.
+    The root aliases reuse the very handler objects (spec 5.1).
     """
     endpoints = OAuthEndpoints(config, manager)
     base = f"{config.base_path}/oauth"
@@ -720,9 +848,14 @@ def oauth_routes(config: OAuthConfig, manager: SessionManager) -> list[Route]:
         ("authorize", _store_guard(endpoints.authorize), ["GET"]),
         ("callback", _store_guard(endpoints.callback), ["GET"]),
         ("consent", _store_guard(endpoints.consent), ["GET", "POST"]),
+        ("token", _store_guard(endpoints.token, json_errors=True), ["POST"]),
+        ("revoke", _store_guard(endpoints.revoke, json_errors=True), ["POST"]),
     ]
     routes = [Route(f"{base}/{name}", fn, methods=m) for name, fn, m in handlers]
-    for name, fn, methods in handlers:
-        if name in ("register", "authorize") and f"/{name}" != f"{base}/{name}":
-            routes.append(Route(f"/{name}", fn, methods=methods))
+    routes.extend(
+        Route(alias, fn, methods=methods)
+        for name, fn, methods in handlers
+        for alias in _ROOT_ALIASES.get(name, ())
+        if alias != f"{base}/{name}"
+    )
     return routes

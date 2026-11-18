@@ -1,11 +1,15 @@
-"""Session management: identity mapping, links and (later) session lifecycle.
+"""Session management: identity mapping, session lifecycle and token grants.
 
-``SessionManager`` is the single owner of per-session and per-user locking.
-Later tasks add session creation, token exchange, verification and cleanup jobs
-to this class; this first part maps IdP identities to NetBox users.
+``SessionManager`` is the single owner of per-session and per-user locking. It
+maps IdP identities to NetBox users, creates sessions with their own NetBox
+token, redeems authorization codes, rotates refresh tokens (spec 5.4, 6.4) and
+revokes sessions (spec 5.5).
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import uuid
 import weakref
@@ -14,21 +18,27 @@ from netbox_mcp.oauth import tokens as token_time
 from netbox_mcp.oauth.broker import BrokerAmbiguous
 from netbox_mcp.oauth.broker import BrokerConflict
 from netbox_mcp.oauth.broker import BrokerDefinite
+from netbox_mcp.oauth.broker import BrokerError
 from netbox_mcp.oauth.broker import BrokerUnavailable
 from netbox_mcp.oauth.broker import NetBoxBroker
 from netbox_mcp.oauth.broker import NetBoxUser
 from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.idp import IdpClient
 from netbox_mcp.oauth.idp import IdpLogin
+from netbox_mcp.oauth.idp import IdpRejected
+from netbox_mcp.oauth.idp import IdpUnavailable
 from netbox_mcp.oauth.state import CleanupEntry
 from netbox_mcp.oauth.state import Client
 from netbox_mcp.oauth.state import Link
 from netbox_mcp.oauth.state import OAuthState
 from netbox_mcp.oauth.state import PendingCreate
+from netbox_mcp.oauth.state import Replay
 from netbox_mcp.oauth.state import Session
 from netbox_mcp.oauth.store import StateStore
 from netbox_mcp.oauth.store import StoreWriteError
+from netbox_mcp.oauth.tokens import SCOPE
 from netbox_mcp.oauth.tokens import AccessTokens
+from netbox_mcp.oauth.tokens import InvalidToken
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +46,7 @@ NETBOX_TOKEN_TTL = 7 * 86400
 RENEW_BELOW = 2 * 86400
 CODE_TTL = 300
 REFRESH_TTL = 30 * 86400
+REPLAY_WINDOW = 30
 DESCRIPTION_MAX = 200
 
 _NO_USER_MESSAGE = (
@@ -65,6 +76,29 @@ class LoginDenied(Exception):  # noqa: N818 - name fixed by the interface
 
 class LoginFailed(Exception):  # noqa: N818 - name fixed by the interface
     """The session could not be created (NetBox token creation failed)."""
+
+
+class GrantError(Exception):
+    """An OAuth token request is refused (RFC 6749 section 5.2, HTTP 400)."""
+
+    def __init__(self, error: str, description: str) -> None:
+        super().__init__(description)
+        self.error = error
+        self.description = description
+
+
+class GrantUnavailable(Exception):  # noqa: N818 - mirrors IdpUnavailable
+    """IdP or NetBox could not answer; the client retries (HTTP 503)."""
+
+
+class _Reject(Exception):  # noqa: N818 - internal control flow
+    """A refresh check failed definitively: end the session."""
+
+    def __init__(self, reason: str, *, eligibility: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        # Eligibility lost (spec 5.3.5): the user's consent grants are dropped.
+        self.eligibility = eligibility
 
 
 class SessionManager:
@@ -116,18 +150,25 @@ class SessionManager:
         logger.warning("oauth login denied: reason=%s user_key=%s", reason, user_key)
         return LoginDenied(reason)
 
-    def _check_eligible(self, user: NetBoxUser, user_key: str) -> None:
+    def _ineligible(self, user: NetBoxUser) -> str | None:
+        """Reason code if the NetBox user may not use this server, else None."""
         # Case-insensitive: the denylist is the only superuser guard when
         # is_superuser is unknown, so over-denying is the safe direction.
         denied = {name.casefold() for name in self.config.user_denylist}
         if user.username.casefold() in denied:
-            raise self._deny("denylisted", user_key)
+            return "denylisted"
         # is_superuser is None when the REST API does not expose it; the
         # mandatory denylist covers that case.
         if user.is_superuser is True:
-            raise self._deny("superuser", user_key)
+            return "superuser"
         if not user.is_active:
-            raise self._deny("inactive_user", user_key)
+            return "inactive_user"
+        return None
+
+    def _check_eligible(self, user: NetBoxUser, user_key: str) -> None:
+        reason = self._ineligible(user)
+        if reason is not None:
+            raise self._deny(reason, user_key)
 
     async def _find(self, username: str, user_key: str) -> NetBoxUser | None:
         try:
@@ -312,58 +353,63 @@ class SessionManager:
         """Replace the session's NetBox token if under 2 days remain.
 
         Failures keep the current token (it is still valid) and are logged.
+        Takes the session lock; use :meth:`renew_if_due_locked` when already
+        holding it.
         """
         async with self.lock_for(sid):
-            snap = self.store.snapshot()
-            session = snap.sessions.get(sid)
-            if session is None:
-                return
-            if session.netbox_token_expires_at is None:
-                logger.warning("oauth: session %s has no token expiry", sid[:8])
-                return
-            now = token_time.now()
-            if session.netbox_token_expires_at - now >= RENEW_BELOW:
-                return
-            client = snap.clients.get(session.client_id)
-            name = client.client_name if client else session.client_id
-            nonce = uuid.uuid4().hex
-            async with self.store.mutate() as state:
-                state.pending[nonce] = PendingCreate(
-                    nonce=nonce,
-                    netbox_user_id=session.netbox_user_id,
-                    sid=sid,
-                    created_at=now,
+            await self.renew_if_due_locked(sid)
+
+    async def renew_if_due_locked(self, sid: str) -> None:
+        snap = self.store.snapshot()
+        session = snap.sessions.get(sid)
+        if session is None:
+            return
+        if session.netbox_token_expires_at is None:
+            logger.warning("oauth: session %s has no token expiry", sid[:8])
+            return
+        now = token_time.now()
+        if session.netbox_token_expires_at - now >= RENEW_BELOW:
+            return
+        client = snap.clients.get(session.client_id)
+        name = client.client_name if client else session.client_id
+        nonce = uuid.uuid4().hex
+        async with self.store.mutate() as state:
+            state.pending[nonce] = PendingCreate(
+                nonce=nonce,
+                netbox_user_id=session.netbox_user_id,
+                sid=sid,
+                created_at=now,
+            )
+        try:
+            created = await self.broker.create_token(
+                session.netbox_user_id,
+                self._description(name, sid, nonce),
+                now + NETBOX_TOKEN_TTL,
+            )
+        except BrokerDefinite:
+            await self._drop_marker(nonce)
+            logger.warning("oauth: renewal refused sid=%s", sid[:8])
+            return
+        except (BrokerAmbiguous, BrokerUnavailable):
+            # Keep marker and current token; recovery handles the marker.
+            logger.warning("oauth: renewal failed sid=%s", sid[:8])
+            return
+        async with self.store.mutate() as state:
+            state.pending.pop(nonce, None)
+            stored = state.sessions.get(sid)
+            if stored is None:
+                self._enqueue(
+                    state, created.token_id, session.netbox_user_id, "orphaned"
                 )
-            try:
-                created = await self.broker.create_token(
-                    session.netbox_user_id,
-                    self._description(name, sid, nonce),
-                    now + NETBOX_TOKEN_TTL,
+            else:
+                self._enqueue(
+                    state, stored.netbox_token_id, stored.netbox_user_id, "renewed"
                 )
-            except BrokerDefinite:
-                await self._drop_marker(nonce)
-                logger.warning("oauth: renewal refused sid=%s", sid[:8])
-                return
-            except (BrokerAmbiguous, BrokerUnavailable):
-                # Keep marker and current token; recovery handles the marker.
-                logger.warning("oauth: renewal failed sid=%s", sid[:8])
-                return
-            async with self.store.mutate() as state:
-                state.pending.pop(nonce, None)
-                stored = state.sessions.get(sid)
-                if stored is None:
-                    self._enqueue(
-                        state, created.token_id, session.netbox_user_id, "orphaned"
-                    )
-                else:
-                    self._enqueue(
-                        state, stored.netbox_token_id, stored.netbox_user_id, "renewed"
-                    )
-                    stored.netbox_token = created.bearer
-                    stored.netbox_token_id = created.token_id
-                    stored.netbox_token_expires_at = created.expires_at
-                    stored.token_version += 1
-            self.cleanup_wanted.set()
+                stored.netbox_token = created.bearer
+                stored.netbox_token_id = created.token_id
+                stored.netbox_token_expires_at = created.expires_at
+                stored.token_version += 1
+        self.cleanup_wanted.set()
 
     async def end_session(self, sid: str, reason: str) -> None:
         """End a session and enqueue its NetBox token. Idempotent.
@@ -374,7 +420,14 @@ class SessionManager:
         async with self.lock_for(sid):
             await self.end_session_locked(sid, reason)
 
-    async def end_session_locked(self, sid: str, reason: str) -> None:
+    async def end_session_locked(
+        self, sid: str, reason: str, *, drop_grants: bool = False
+    ) -> None:
+        """End a session (caller holds its lock).
+
+        ``drop_grants`` also removes every consent grant of the session's user
+        in the same write (eligibility lost, spec 5.3.5).
+        """
         async with self.store.mutate() as state:
             session = state.sessions.pop(sid, None)
             if session is None:
@@ -382,5 +435,335 @@ class SessionManager:
             self._enqueue(
                 state, session.netbox_token_id, session.netbox_user_id, reason
             )
-        logger.info("oauth session ended sid=%s reason=%s", sid[:8], reason)
+            if drop_grants:
+                for key in [
+                    k for k, g in state.grants.items() if g.user_key == session.user_key
+                ]:
+                    del state.grants[key]
+        logger.info("session_ended sid=%s reason=%s", sid[:8], reason)
         self.cleanup_wanted.set()
+
+    # ------------------------------------------------------------ token grants
+
+    def _resource_ok(self, resource: str | None) -> bool:
+        """Spec 5.3: absent, or this server's URL with at most one trailing /."""
+        return resource is None or resource.removesuffix("/") == self.config.public_url
+
+    def _token_response(self, session: Session) -> tuple[dict, str]:
+        """New access and refresh token; returns the response and the refresh token."""
+        access, expires_in = self.tokens.issue(
+            session.sid, session.user_key, session.client_id
+        )
+        refresh_token = token_time.new_secret()
+        response = {
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "refresh_token": refresh_token,
+            "scope": SCOPE,
+        }
+        return response, refresh_token
+
+    @staticmethod
+    def _pkce_ok(verifier: str, challenge: str | None) -> bool:
+        if not challenge:
+            return False
+        digest = hashlib.sha256(verifier.encode()).digest()
+        computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+        return hmac.compare_digest(computed.encode(), challenge.encode())
+
+    def _session_by_code(self, code_hash: str) -> str | None:
+        for session in self.store.snapshot().sessions.values():
+            if session.code_hash is not None and hmac.compare_digest(
+                session.code_hash, code_hash
+            ):
+                return session.sid
+        return None
+
+    async def redeem_code(
+        self,
+        code: str,
+        client_id: str,
+        redirect_uri: str,
+        verifier: str,
+        resource: str | None,
+    ) -> dict:
+        """Exchange an authorization code for the first token pair (spec 5.4).
+
+        The code is burned on the first attempt, also a failed one; a session
+        whose code was burned without success stays unredeemed and is ended by
+        the orphan cleanup.
+
+        Raises:
+            GrantError: ``invalid_grant`` or ``invalid_target``.
+            StoreWriteError: The redemption could not be persisted (nothing
+                was issued; the code is still unburned).
+        """
+        code_hash = token_time.hash_secret(code)
+        sid = self._session_by_code(code_hash)
+        if sid is None:
+            raise GrantError("invalid_grant", "unknown, used or expired code")
+        async with self.lock_for(sid):
+            session = self.store.snapshot().sessions.get(sid)
+            if session is None or session.code_hash != code_hash:
+                raise GrantError("invalid_grant", "unknown, used or expired code")
+            now = token_time.now()
+            problem: GrantError | None = None
+            if session.code_expires_at is None or now >= session.code_expires_at:
+                problem = GrantError("invalid_grant", "code expired")
+            elif client_id != session.client_id:
+                problem = GrantError(
+                    "invalid_grant", "code was issued to another client"
+                )
+            elif redirect_uri != session.code_redirect_uri:
+                problem = GrantError("invalid_grant", "redirect_uri does not match")
+            elif not self._pkce_ok(verifier, session.code_challenge):
+                problem = GrantError("invalid_grant", "code_verifier does not match")
+            elif not self._resource_ok(resource):
+                problem = GrantError("invalid_target", "resource is not this server")
+            response, refresh_token = (
+                self._token_response(session) if problem is None else ({}, "")
+            )
+            async with self.store.mutate() as state:
+                stored = state.sessions.get(sid)
+                if stored is None:
+                    raise GrantError("invalid_grant", "session ended")
+                stored.code_hash = None
+                stored.code_expires_at = None
+                stored.code_redirect_uri = None
+                stored.code_challenge = None
+                stored.code_resource = None
+                if problem is None:
+                    stored.code_redeemed = True
+                    stored.refresh_hash = token_time.hash_secret(refresh_token)
+                    stored.refresh_deadline = now + REFRESH_TTL
+                    client = state.clients.get(stored.client_id)
+                    if client is not None:
+                        client.last_used_at = now
+        if problem is not None:
+            logger.warning(
+                "code_rejected sid=%s error=%s reason=%s",
+                sid[:8],
+                problem.error,
+                problem.description,
+            )
+            raise problem
+        logger.info("code_redeemed sid=%s", sid[:8])
+        return response
+
+    def _session_by_refresh(self, token_hash: str) -> str | None:
+        """Session holding this refresh token as current, replay slot or spent."""
+        for session in self.store.snapshot().sessions.values():
+            if (
+                session.refresh_hash == token_hash
+                or (session.replay is not None and session.replay.hash == token_hash)
+                or token_hash in session.spent_hashes
+            ):
+                return session.sid
+        return None
+
+    def _refresh_rejected(self, sid: str | None, reason: str) -> GrantError:
+        logger.warning(
+            "refresh_rejected reason=%s sid=%s", reason, sid[:8] if sid else "-"
+        )
+        return GrantError("invalid_grant", "refresh token is invalid or expired")
+
+    async def refresh(
+        self, refresh_token: str, client_id: str | None, resource: str | None
+    ) -> dict:
+        """Refresh-token grant with rotation, replay window and IdP check.
+
+        Under the session lock, in this order (spec 5.4, 6.4):
+
+        1. Look up the token: current, replay slot (< 30 s: return the stored
+           response, no other call), or spent (end the session). Check client,
+           deadline and a leftover IdP refresh mark (fail closed).
+        2. Write: mark the IdP refresh as started.
+        3. Refresh the IdP token.
+        4. Write: store the rotated IdP refresh token and clear the mark.
+        5. Userinfo: subject and group check.
+        6. NetBox: user still eligible, session token exists and is enabled;
+           renew the NetBox token if due.
+        7. Write: rotate our refresh token, record the spent hash and the
+           replay slot, extend the sliding deadline.
+
+        The response is returned only after the final write succeeded.
+
+        Raises:
+            GrantError: ``invalid_grant`` or ``invalid_target``.
+            GrantUnavailable: IdP or NetBox unavailable; nothing rotated.
+            StoreWriteError: A write failed; the previous token stays valid.
+        """
+        if not self._resource_ok(resource):
+            raise GrantError("invalid_target", "resource is not this server")
+        token_hash = token_time.hash_secret(refresh_token)
+        sid = self._session_by_refresh(token_hash)
+        if sid is None:
+            raise self._refresh_rejected(None, "unknown_token")
+        async with self.lock_for(sid):
+            return await self._refresh_locked(sid, token_hash, client_id)
+
+    async def _refresh_locked(
+        self, sid: str, token_hash: str, client_id: str | None
+    ) -> dict:
+        snap = self.store.snapshot()
+        session = snap.sessions.get(sid)
+        if session is None:
+            raise self._refresh_rejected(sid, "session_ended")
+        now = token_time.now()
+        replay = session.replay
+        if session.refresh_hash != token_hash:
+            if (
+                replay is not None
+                and replay.hash == token_hash
+                and now - replay.rotated_at < REPLAY_WINDOW
+            ):
+                if client_id is not None and client_id != session.client_id:
+                    raise self._refresh_rejected(sid, "client_mismatch")
+                logger.info("token_replayed sid=%s", sid[:8])
+                return dict(replay.response)
+            if token_hash in session.spent_hashes or (
+                replay is not None and replay.hash == token_hash
+            ):
+                await self.end_session_locked(sid, "refresh_reuse")
+                raise self._refresh_rejected(sid, "refresh_reuse")
+            raise self._refresh_rejected(sid, "unknown_token")
+        if client_id is not None and client_id != session.client_id:
+            raise self._refresh_rejected(sid, "client_mismatch")
+        if now >= session.refresh_deadline:
+            await self.end_session_locked(sid, "expired")
+            raise self._refresh_rejected(sid, "expired")
+        if session.idp_refresh_started_at is not None:
+            # A previous IdP refresh has an unknown outcome (crash before its
+            # result was stored): the stored IdP token may be spent.
+            await self.end_session_locked(sid, "idp_refresh_unknown")
+            raise self._refresh_rejected(sid, "idp_refresh_unknown")
+        link = snap.links.get(session.user_key)
+        if link is None or session.idp_refresh_token is None:
+            await self.end_session_locked(sid, "identity_missing", drop_grants=True)
+            raise self._refresh_rejected(sid, "identity_missing")
+
+        try:
+            await self._check_upstream(session, link.sub, session.idp_refresh_token)
+        except _Reject as exc:
+            await self.end_session_locked(sid, exc.reason, drop_grants=exc.eligibility)
+            raise self._refresh_rejected(sid, exc.reason) from None
+
+        # Step 7: one write rotates our refresh token.
+        response, refresh_token = self._token_response(session)
+        now = token_time.now()
+        async with self.store.mutate() as state:
+            stored = state.sessions.get(sid)
+            if stored is None or stored.refresh_hash != token_hash:
+                raise self._refresh_rejected(sid, "session_ended")
+            stored.spent_hashes.append(token_hash)
+            stored.refresh_hash = token_time.hash_secret(refresh_token)
+            stored.replay = Replay(hash=token_hash, rotated_at=now, response=response)
+            stored.refresh_deadline = now + REFRESH_TTL
+            stored.last_idp_check_at = now
+            client = state.clients.get(stored.client_id)
+            name = client.client_name if client else "-"
+            if client is not None:
+                client.last_used_at = now
+        logger.info("token_refreshed sid=%s client=%s", sid[:8], name or "-")
+        return response
+
+    async def _check_upstream(
+        self, session: Session, sub: str, idp_refresh_token: str
+    ) -> None:
+        """Steps 2 to 6 of :meth:`refresh` (caller holds the session lock).
+
+        Raises:
+            _Reject: The session must end.
+            GrantUnavailable: IdP or NetBox unavailable; session unchanged
+                except for a rotated IdP refresh token.
+            StoreWriteError: A write failed.
+        """
+        sid = session.sid
+        # Step 2: mark, so a crash after the IdP rotated fails closed.
+        async with self.store.mutate() as state:
+            stored = state.sessions.get(sid)
+            if stored is None:
+                raise _Reject("session_ended")
+            stored.idp_refresh_started_at = token_time.now()
+        # Step 3.
+        try:
+            idp_tokens = await self.idp.refresh(idp_refresh_token)
+        except IdpRejected as exc:
+            logger.warning("oauth refresh: IdP rejected: %s", exc.reason)
+            raise _Reject("idp_rejected") from None
+        except IdpUnavailable as exc:
+            logger.warning("oauth refresh: IdP unavailable: %s", exc.reason)
+            await self._persist_idp_refresh(sid, None)
+            raise GrantUnavailable("identity provider unavailable") from None
+        # Step 4: persist the rotated IdP token first, in its own write.
+        await self._persist_idp_refresh(sid, idp_tokens.refresh_token)
+        # Step 5.
+        try:
+            groups = await self.idp.userinfo(idp_tokens.access_token, sub)
+        except IdpRejected as exc:
+            logger.warning("oauth refresh: userinfo rejected: %s", exc.reason)
+            raise _Reject("userinfo_rejected", eligibility=True) from None
+        except IdpUnavailable as exc:
+            logger.warning("oauth refresh: userinfo unavailable: %s", exc.reason)
+            raise GrantUnavailable("identity provider unavailable") from None
+        if not set(groups) & set(self.config.allowed_groups):
+            raise _Reject("no_group", eligibility=True)
+        # Step 6.
+        try:
+            user = await self.broker.get_user(session.netbox_user_id)
+            if user is None:
+                raise _Reject("no_netbox_user", eligibility=True)
+            reason = self._ineligible(user)
+            if reason is not None:
+                raise _Reject(reason, eligibility=True)
+            info = await self.broker.get_token(session.netbox_token_id)
+        except BrokerError as exc:
+            logger.warning("oauth refresh: NetBox unavailable: %s", exc)
+            raise GrantUnavailable("NetBox unavailable") from None
+        if info is None:
+            raise _Reject("netbox_token_missing")
+        if not info.enabled:
+            raise _Reject("netbox_token_disabled")
+        await self.renew_if_due_locked(sid)
+
+    async def _persist_idp_refresh(self, sid: str, new_token: str | None) -> None:
+        """Store a rotated IdP refresh token (if any) and clear the mark."""
+        async with self.store.mutate() as state:
+            stored = state.sessions.get(sid)
+            if stored is None:
+                return
+            if new_token is not None:
+                stored.idp_refresh_token = new_token
+            stored.idp_refresh_started_at = None
+
+    # -------------------------------------------------------------- revocation
+
+    async def revoke(self, token: str, client_id: str | None) -> None:
+        """RFC 7009 revocation (spec 5.5): end the token's session, if any.
+
+        Unknown or invalid tokens and a ``client_id`` mismatch have no effect.
+
+        Raises:
+            StoreWriteError: The session could not be ended.
+        """
+        sid: str | None = None
+        owner: str | None = None
+        try:
+            claims = self.tokens.verify(token, allow_expired=True)
+        except InvalidToken:
+            sid = self._session_by_refresh(token_time.hash_secret(token))
+        else:
+            sid, owner = claims["sid"], claims["client_id"]
+        if sid is None:
+            return
+        async with self.lock_for(sid):
+            session = self.store.snapshot().sessions.get(sid)
+            if session is None:
+                return
+            if owner is not None and owner != session.client_id:
+                return
+            if client_id is not None and client_id != session.client_id:
+                logger.warning("revoke ignored: client mismatch sid=%s", sid[:8])
+                return
+            await self.end_session_locked(sid, "revoked")
