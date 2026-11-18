@@ -10,6 +10,8 @@ Error messages never contain state content or key material.
 
 import asyncio
 import contextlib
+import errno
+import json
 import os
 import secrets
 import sys
@@ -57,6 +59,10 @@ class StoreLocked(StoreError):  # noqa: N818 - name fixed by the plan
     """Another process holds the state file lock."""
 
 
+class _CommitUncertainError(Exception):
+    """The rename happened but its durability could not be confirmed."""
+
+
 class StoreWriteError(StoreError):
     """A change could not be persisted; it was discarded."""
 
@@ -83,8 +89,11 @@ def _decrypt(data: bytes, key: bytes) -> OAuthState:
             "state file cannot be decrypted (wrong key or corrupt file)"
         ) from None
     try:
-        return OAuthState.model_validate_json(plain)
-    except ValidationError:
+        raw = json.loads(plain)
+        if not isinstance(raw, dict) or set(raw) != set(OAuthState.model_fields):
+            raise ValueError("top-level keys")
+        return OAuthState.model_validate(raw)
+    except (ValueError, ValidationError):
         raise StoreError("state file content does not match the schema") from None
 
 
@@ -99,20 +108,35 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def _write_atomic(path: Path, data: bytes) -> None:
-    """Replace ``path`` with ``data``: temp file in the same dir, fsync, rename."""
+def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
+    """Publish ``data`` at ``path``: temp file in the same dir, fsync, rename.
+
+    With ``overwrite=False`` an existing file is never replaced
+    (``FileExistsError``). Raises ``_CommitUncertainError`` if the file is in
+    place but the directory fsync failed.
+    """
     tmp = path.with_name(path.name + ".tmp")
     try:
         with tmp.open("wb") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(path)
+        if overwrite:
+            tmp.replace(path)
+        else:
+            os.link(tmp, path)
+            tmp.unlink()
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
-    _fsync_dir(path.parent)
+    try:
+        _fsync_dir(path.parent)
+    except OSError:
+        raise _CommitUncertainError from None
+
+
+_CONTENTION = frozenset({errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK})
 
 
 def _acquire_lock(path: Path) -> int:
@@ -123,9 +147,11 @@ def _acquire_lock(path: Path) -> int:
         raise StoreError(f"cannot open lock file: {exc.strerror}") from None
     try:
         _lock_file(fd)
-    except OSError:
+    except OSError as exc:
         os.close(fd)
-        raise StoreLocked("state file is locked by another process") from None
+        if exc.errno in _CONTENTION:
+            raise StoreLocked("state file is locked by another process") from None
+        raise StoreError(f"cannot lock state file: {exc.strerror}") from None
     return fd
 
 
@@ -145,18 +171,27 @@ class StateStore:
         self._state = state
         self._lock_fd: int | None = lock_fd
         self._mutex = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._failed = False
 
     @classmethod
     def create(cls, path: Path, key: bytes) -> None:
-        """Write an empty state file; refuse if the file already exists."""
+        """Write an empty state file; never overwrites an existing file."""
         _check_key(key)
         path = Path(path)
         if path.exists():
             raise StoreError(f"state file already exists: {path}")
+        lock_fd = _acquire_lock(path)
         try:
-            _write_atomic(path, _encrypt(OAuthState(), key))
+            _write_atomic(path, _encrypt(OAuthState(), key), overwrite=False)
+        except FileExistsError:
+            raise StoreError(f"state file already exists: {path}") from None
+        except _CommitUncertainError:
+            raise StoreError("state file created but not confirmed durable") from None
         except OSError as exc:
             raise StoreError(f"cannot create state file: {exc.strerror}") from None
+        finally:
+            _release_lock(lock_fd)
 
     @classmethod
     def open(cls, path: Path, key: bytes) -> "StateStore":
@@ -192,27 +227,53 @@ class StateStore:
 
         On an exception in the body the changes are discarded and the exception
         propagates. If persisting fails, the previous in-memory state is kept
-        and ``StoreWriteError`` is raised.
+        and ``StoreWriteError`` is raised. If the outcome of the commit is
+        indeterminate, the store is marked failed: every further ``mutate``
+        raises ``StoreWriteError`` until the file is reopened.
         """
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            raise StoreError("nested mutate() would deadlock")
         async with self._mutex:
             if self._lock_fd is None:
                 raise StoreError("state store is closed")
-            working = self._state.model_copy(deep=True)
-            yield working
+            if self._failed:
+                raise StoreWriteError("state store failed; reopen required")
+            self._owner = task
             try:
-                self._write_file(_encrypt(working, self._key))
-            except Exception:
-                raise StoreWriteError(
-                    "cannot write state file; change discarded"
-                ) from None
-            self._state = working
+                working = self._state.model_copy(deep=True)
+                yield working
+                try:
+                    self._write_file(_encrypt(working, self._key))
+                except _CommitUncertainError:
+                    self._failed = True
+                    raise StoreWriteError(
+                        "state write not confirmed; reopen required"
+                    ) from None
+                except Exception:
+                    raise StoreWriteError(
+                        "cannot write state file; change discarded"
+                    ) from None
+                self._state = working.model_copy(deep=True)
+            finally:
+                self._owner = None
 
     def _write_file(self, data: bytes) -> None:
         """The single place that writes the state file."""
         _write_atomic(self._path, data)
 
+    async def aclose(self) -> None:
+        """Release the lock after any in-flight mutate has finished."""
+        async with self._mutex:
+            self._release()
+
     def close(self) -> None:
-        """Release the lock; idempotent."""
+        """Release the lock (non-async callers); refuses while a mutate runs."""
+        if self._mutex.locked():
+            raise StoreError("cannot close while a mutate is in flight")
+        self._release()
+
+    def _release(self) -> None:
         if self._lock_fd is not None:
             _release_lock(self._lock_fd)
             self._lock_fd = None

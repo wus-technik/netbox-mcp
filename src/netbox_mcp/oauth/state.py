@@ -4,11 +4,20 @@ All timestamps are epoch seconds (``float``). Dicts are keyed by the ID named
 in each model's docstring.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel
+from pydantic import ConfigDict
 from pydantic import Field
 
 
-class Client(BaseModel):
+class _Model(BaseModel):
+    """Base: unknown fields are rejected so a damaged file fails closed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Client(_Model):
     """Registered OAuth client, keyed by ``client_id``."""
 
     client_id: str
@@ -18,7 +27,7 @@ class Client(BaseModel):
     last_used_at: float
 
 
-class Grant(BaseModel):
+class Grant(_Model):
     """Consent grant, keyed by ``f"{user_key}|{client_id}"``."""
 
     user_key: str
@@ -26,7 +35,7 @@ class Grant(BaseModel):
     created_at: float
 
 
-class Flow(BaseModel):
+class Flow(_Model):
     """Login flow, keyed by ``flow_id``."""
 
     flow_id: str
@@ -44,7 +53,7 @@ class Flow(BaseModel):
     idp_refresh_token: str | None = None
 
 
-class Link(BaseModel):
+class Link(_Model):
     """Identity link, keyed by ``user_key`` (``f"{iss}|{sub}"``)."""
 
     user_key: str
@@ -55,7 +64,7 @@ class Link(BaseModel):
     created_at: float
 
 
-class Replay(BaseModel):
+class Replay(_Model):
     """Replay slot of the last refresh rotation."""
 
     hash: str
@@ -63,7 +72,7 @@ class Replay(BaseModel):
     response: dict
 
 
-class Session(BaseModel):
+class Session(_Model):
     """Session, keyed by ``sid``."""
 
     sid: str
@@ -89,7 +98,7 @@ class Session(BaseModel):
     token_version: int = 1
 
 
-class PendingCreate(BaseModel):
+class PendingCreate(_Model):
     """Marker for a NetBox token being created, keyed by ``nonce``."""
 
     nonce: str
@@ -98,7 +107,7 @@ class PendingCreate(BaseModel):
     created_at: float
 
 
-class CleanupEntry(BaseModel):
+class CleanupEntry(_Model):
     """NetBox token awaiting deletion, keyed by ``entry_id``."""
 
     entry_id: str
@@ -110,10 +119,10 @@ class CleanupEntry(BaseModel):
     warned_at: float | None = None
 
 
-class OAuthState(BaseModel):
+class OAuthState(_Model):
     """Complete persisted state."""
 
-    version: int = 1
+    version: Literal[1] = 1
     clients: dict[str, Client] = Field(default_factory=dict)
     grants: dict[str, Grant] = Field(default_factory=dict)
     flows: dict[str, Flow] = Field(default_factory=dict)

@@ -1,4 +1,7 @@
+import asyncio
+import errno
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -216,7 +219,7 @@ async def test_write_is_atomic_tmp_in_same_dir(
     sys.platform == "win32", reason="directory fsync is a no-op on Windows"
 )
 @pytest.mark.asyncio
-async def test_directory_is_fsynced_after_replace(
+async def test_file_and_directory_are_fsynced_separately(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state.bin"
@@ -225,16 +228,25 @@ async def test_directory_is_fsynced_after_replace(
     calls: list[str] = []
     real_replace, real_fsync = os.replace, os.fsync
 
-    monkeypatch.setattr(
-        os, "replace", lambda a, b: (calls.append("replace"), real_replace(a, b))
-    )
-    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd)))
+    def spy_fsync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        calls.append(
+            "dir" if stat.S_ISDIR(mode) else "file" if stat.S_ISREG(mode) else "?"
+        )
+        real_fsync(fd)
+
+    def spy_replace(a: object, b: object) -> None:
+        calls.append("replace")
+        real_replace(a, b)
+
+    monkeypatch.setattr(os, "replace", spy_replace)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
     try:
         async with s.mutate() as state:
             state.clients["c1"] = _client()
     finally:
         s.close()
-    assert calls == ["fsync", "replace", "fsync"]
+    assert calls == ["file", "replace", "dir"]
 
 
 def test_error_messages_hold_no_key_material(tmp_path: Path) -> None:
@@ -251,3 +263,149 @@ async def test_store_fixture(store: StateStore) -> None:
         state.clients["c1"] = _client()
     assert "c1" in store.snapshot().clients
     assert store_module.MAGIC == b"NBMCPOA1"
+
+
+def _write_raw(path: Path, payload: bytes) -> None:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    nonce = b"n" * 12
+    path.write_bytes(
+        b"NBMCPOA1"
+        + nonce
+        + AESGCM(KEY).encrypt(nonce, payload, b"netbox-mcp-oauth-state-v1")
+    )
+
+
+_EMPTY = (
+    b'"clients": {}, "grants": {}, "flows": {}, "links": {},'
+    b' "sessions": {}, "pending": {}, "cleanup": {}'
+)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b'{"version": 2, ' + _EMPTY + b"}",
+        b'{"version": 1, ' + _EMPTY + b', "extra": 1}',
+        b'{"version": 1, "clients": {"c": {"client_id": "c", "client_name": "n",'
+        b' "redirect_uris": [], "created_at": 1, "last_used_at": 1, "bogus": 1}},'
+        b' "grants": {}, "flows": {}, "links": {}, "sessions": {}, "pending": {},'
+        b' "cleanup": {}}',
+        b"[]",
+    ],
+)
+def test_strict_schema_rejected(tmp_path: Path, payload: bytes) -> None:
+    path = tmp_path / "state.bin"
+    _write_raw(path, payload)
+    with pytest.raises(StoreError, match="schema"):
+        StateStore.open(path, KEY)
+
+
+@pytest.mark.asyncio
+async def test_dir_fsync_failure_marks_store_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    s = StateStore.open(path, KEY)
+
+    def bad_fsync_dir(_d: Path) -> None:
+        raise OSError("io error")
+
+    monkeypatch.setattr(store_module, "_fsync_dir", bad_fsync_dir)
+    try:
+        with pytest.raises(StoreWriteError):
+            async with s.mutate() as state:
+                state.clients["c1"] = _client()
+        monkeypatch.undo()
+        with pytest.raises(StoreWriteError, match="reopen"):
+            async with s.mutate():
+                pass
+    finally:
+        s.close()
+    again = StateStore.open(path, KEY)
+    try:
+        assert "c1" in again.snapshot().clients
+    finally:
+        again.close()
+
+
+@pytest.mark.asyncio
+async def test_close_during_mutate_is_refused_and_aclose_waits(tmp_path: Path) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    s = StateStore.open(path, KEY)
+    async with s.mutate() as state:
+        state.clients["c1"] = _client()
+        with pytest.raises(StoreError, match="in flight"):
+            s.close()
+        closer = asyncio.create_task(s.aclose())
+        await asyncio.sleep(0.01)
+        assert not closer.done()
+    await closer
+    with pytest.raises(StoreError, match="closed"):
+        async with s.mutate():
+            pass
+    again = StateStore.open(path, KEY)
+    try:
+        assert "c1" in again.snapshot().clients
+    finally:
+        again.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_object_is_not_live_memory(store: StateStore) -> None:
+    async with store.mutate() as state:
+        state.clients["c1"] = _client()
+    state.clients["c2"] = _client("c2")  # edit after commit, never written
+    assert set(store.snapshot().clients) == {"c1"}
+
+
+def test_create_never_overwrites_a_file_appearing_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    path.write_bytes(b"precious")
+    monkeypatch.setattr(Path, "exists", lambda _self: False)
+    with pytest.raises(StoreError, match="exists"):
+        StateStore.create(path, KEY)
+    assert path.read_bytes() == b"precious"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_nested_mutate_raises_instead_of_deadlocking(store: StateStore) -> None:
+    async def nested() -> None:
+        async with store.mutate(), store.mutate():
+            pass
+
+    with pytest.raises(StoreError, match="nested"):
+        await asyncio.wait_for(nested(), timeout=2)
+    async with store.mutate() as state:
+        state.clients["c1"] = _client()
+
+
+@pytest.mark.parametrize(
+    ("code", "locked"),
+    [
+        (errno.EACCES, True),
+        (errno.EAGAIN, True),
+        (errno.EDEADLK, True),
+        (errno.EIO, False),
+        (errno.ENOSPC, False),
+    ],
+)
+def test_lock_errno_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, locked: bool
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+
+    def fail(_fd: int) -> None:
+        raise OSError(code, "x")
+
+    monkeypatch.setattr(store_module, "_lock_file", fail)
+    with pytest.raises(StoreError) as exc:
+        StateStore.open(path, KEY)
+    assert isinstance(exc.value, StoreLocked) is locked
