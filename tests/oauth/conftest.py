@@ -1,9 +1,11 @@
 import base64
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from netbox_mcp.oauth.config import OAuthConfig
+from netbox_mcp.oauth.store import StateStore
 
 OAUTH_ENV = {
     "OIDC_ISSUER": "https://idp.example.com/realm",
@@ -48,3 +50,11 @@ class Clock:
 @pytest.fixture
 def clock() -> Clock:
     return Clock()
+
+
+@pytest.fixture
+def store(oauth_config: OAuthConfig) -> Iterator[StateStore]:
+    StateStore.create(oauth_config.state_path, oauth_config.state_key)
+    opened = StateStore.open(oauth_config.state_path, oauth_config.state_key)
+    yield opened
+    opened.close()

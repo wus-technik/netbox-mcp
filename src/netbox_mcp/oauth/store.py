@@ -1,0 +1,218 @@
+"""Encrypted single-file state store.
+
+File format: ``MAGIC + nonce(12) + AES-256-GCM(json, aad=AAD)``. Writes go to a
+temp file in the same directory, are fsynced and renamed over the state file.
+An exclusive OS lock on ``<path>.lock`` (not on the state file, so the rename
+works on Windows) keeps a second process out.
+
+Error messages never contain state content or key material.
+"""
+
+import asyncio
+import contextlib
+import os
+import secrets
+import sys
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pydantic import ValidationError
+
+from netbox_mcp.oauth.state import OAuthState
+
+MAGIC = b"NBMCPOA1"
+AAD = b"netbox-mcp-oauth-state-v1"
+NONCE_BYTES = 12
+TAG_BYTES = 16
+KEY_BYTES = 32
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_file(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+    def _unlock_file(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _lock_file(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _unlock_file(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+class StoreError(Exception):
+    """The state file cannot be used; the server must not start."""
+
+
+class StoreLocked(StoreError):  # noqa: N818 - name fixed by the plan
+    """Another process holds the state file lock."""
+
+
+class StoreWriteError(StoreError):
+    """A change could not be persisted; it was discarded."""
+
+
+def _check_key(key: bytes) -> None:
+    if len(key) != KEY_BYTES:
+        raise StoreError(f"state key must be {KEY_BYTES} bytes")
+
+
+def _encrypt(state: OAuthState, key: bytes) -> bytes:
+    nonce = secrets.token_bytes(NONCE_BYTES)
+    plain = state.model_dump_json().encode()
+    return MAGIC + nonce + AESGCM(key).encrypt(nonce, plain, AAD)
+
+
+def _decrypt(data: bytes, key: bytes) -> OAuthState:
+    if not data.startswith(MAGIC) or len(data) < len(MAGIC) + NONCE_BYTES + TAG_BYTES:
+        raise StoreError("state file is not a valid encrypted state file")
+    nonce = data[len(MAGIC) : len(MAGIC) + NONCE_BYTES]
+    try:
+        plain = AESGCM(key).decrypt(nonce, data[len(MAGIC) + NONCE_BYTES :], AAD)
+    except InvalidTag:
+        raise StoreError(
+            "state file cannot be decrypted (wrong key or corrupt file)"
+        ) from None
+    try:
+        return OAuthState.model_validate_json(plain)
+    except ValidationError:
+        raise StoreError("state file content does not match the schema") from None
+
+
+def _fsync_dir(directory: Path) -> None:
+    """fsync the directory so the rename is durable (no-op on Windows)."""
+    if sys.platform == "win32":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data``: temp file in the same dir, fsync, rename."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    _fsync_dir(path.parent)
+
+
+def _acquire_lock(path: Path) -> int:
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise StoreError(f"cannot open lock file: {exc.strerror}") from None
+    try:
+        _lock_file(fd)
+    except OSError:
+        os.close(fd)
+        raise StoreLocked("state file is locked by another process") from None
+    return fd
+
+
+def _release_lock(fd: int) -> None:
+    with contextlib.suppress(OSError):
+        _unlock_file(fd)
+    with contextlib.suppress(OSError):
+        os.close(fd)
+
+
+class StateStore:
+    """Holds the state in memory and persists every change atomically."""
+
+    def __init__(self, path: Path, key: bytes, state: OAuthState, lock_fd: int):
+        self._path = path
+        self._key = key
+        self._state = state
+        self._lock_fd: int | None = lock_fd
+        self._mutex = asyncio.Lock()
+
+    @classmethod
+    def create(cls, path: Path, key: bytes) -> None:
+        """Write an empty state file; refuse if the file already exists."""
+        _check_key(key)
+        path = Path(path)
+        if path.exists():
+            raise StoreError(f"state file already exists: {path}")
+        try:
+            _write_atomic(path, _encrypt(OAuthState(), key))
+        except OSError as exc:
+            raise StoreError(f"cannot create state file: {exc.strerror}") from None
+
+    @classmethod
+    def open(cls, path: Path, key: bytes) -> "StateStore":
+        """Lock and load the state file.
+
+        Raises:
+            StoreLocked: another process holds the lock.
+            StoreError: file missing, unreadable, undecryptable or invalid.
+        """
+        _check_key(key)
+        path = Path(path)
+        if not path.is_file():
+            raise StoreError(f"state file not found: {path}")
+        lock_fd = _acquire_lock(path)
+        try:
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                raise StoreError(f"cannot read state file: {exc.strerror}") from None
+            state = _decrypt(data, key)
+        except BaseException:
+            _release_lock(lock_fd)
+            raise
+        return cls(path, key, state, lock_fd)
+
+    def snapshot(self) -> OAuthState:
+        """Deep copy of the current state."""
+        return self._state.model_copy(deep=True)
+
+    @contextlib.asynccontextmanager
+    async def mutate(self) -> AsyncIterator[OAuthState]:
+        """Serialized read-modify-write; persists on clean exit.
+
+        On an exception in the body the changes are discarded and the exception
+        propagates. If persisting fails, the previous in-memory state is kept
+        and ``StoreWriteError`` is raised.
+        """
+        async with self._mutex:
+            if self._lock_fd is None:
+                raise StoreError("state store is closed")
+            working = self._state.model_copy(deep=True)
+            yield working
+            try:
+                self._write_file(_encrypt(working, self._key))
+            except Exception:
+                raise StoreWriteError(
+                    "cannot write state file; change discarded"
+                ) from None
+            self._state = working
+
+    def _write_file(self, data: bytes) -> None:
+        """The single place that writes the state file."""
+        _write_atomic(self._path, data)
+
+    def close(self) -> None:
+        """Release the lock; idempotent."""
+        if self._lock_fd is not None:
+            _release_lock(self._lock_fd)
+            self._lock_fd = None
