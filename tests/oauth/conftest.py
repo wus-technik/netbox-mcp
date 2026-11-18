@@ -48,8 +48,11 @@ class Clock:
 
 
 @pytest.fixture
-def clock() -> Clock:
-    return Clock()
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    """Settable time source wired into ``netbox_mcp.oauth.tokens.now``."""
+    c = Clock()
+    monkeypatch.setattr("netbox_mcp.oauth.tokens.now", c)
+    return c
 
 
 @pytest.fixture
