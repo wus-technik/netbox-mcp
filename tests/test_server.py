@@ -20,6 +20,7 @@ from fastmcp.server.middleware.response_limiting import ResponseLimitingMiddlewa
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.server.transforms.search import RegexSearchTransform
 
+from netbox_mcp.auth import DenyAllTokenVerifier
 from netbox_mcp.auth import NetBoxTokenVerifier
 
 MODULE = "netbox_mcp.server"
@@ -274,6 +275,8 @@ def test_main_refuses_oauth_mode_until_implemented(load_server, monkeypatch, tmp
 
     assert exc.value.code == 1
     server.mcp.run.assert_not_called()
+    # `fastmcp run` skips main(), so the import itself must deny every token.
+    assert isinstance(server.mcp.auth, DenyAllTokenVerifier)
 
 
 def test_main_runs_stdio_by_default(load_server, caplog):

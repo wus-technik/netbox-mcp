@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel
+from pydantic import Field
 from pydantic import SecretStr
 
 from netbox_mcp.utils import env_bool
@@ -35,7 +36,7 @@ class OAuthConfig(BaseModel):
     extra_scopes: list[str] = []
     broker_token: SecretStr
     signing_key: SecretStr
-    state_key: bytes
+    state_key: bytes = Field(repr=False)
     state_path: Path
     extra_redirect_uris: list[str] = []
     extra_origins: list[str] = []
@@ -74,6 +75,8 @@ def _check_public_url(name: str, value: str) -> str:
         _ = parts.port  # raises ValueError on an invalid port
     except ValueError:
         raise ValueError(f"{name} is not a valid URL: {value!r}") from None
+    if any(c.isspace() or not c.isprintable() for c in value):
+        raise ValueError(f"{name} must not contain whitespace or control characters")
     if parts.scheme not in ("http", "https") or not host:
         raise ValueError(f"{name} must be an absolute http(s) URL, got {value!r}")
     if parts.scheme == "http" and host not in _LOOPBACK_HOSTS:

@@ -1,6 +1,7 @@
 import base64
 
 import pytest
+from fastmcp.server.auth.auth import TokenVerifier
 
 from netbox_mcp.auth import build_auth_provider
 from netbox_mcp.models import NetBoxConfig
@@ -34,7 +35,15 @@ def test_valid_env_and_defaults():
     assert config.allowed_groups == ["netbox-users"]
     assert config.state_key == b"k" * 32
     assert config.auth_debug is False
-    assert "client-secret" not in repr(config)
+    shown = repr(config)
+    for secret in (
+        "client-secret",
+        "nbt_broker.secret",
+        OAUTH_ENV["OAUTH_SIGNING_KEY"],
+    ):
+        assert secret not in shown
+    assert "kkkk" not in shown
+    assert repr(b"k" * 32) not in shown
 
 
 def test_optional_values(env):
@@ -62,6 +71,9 @@ def test_missing_required_var_names_it(env, name):
         "https://example.com/mcp?a=1",
         "https://example.com/mcp#x",
         "https://u@example.com/mcp",
+        "https://exa mple.com/mcp",
+        "https://example.com/m\tcp",
+        "https://example.com/m\x01cp",
     ],
 )
 def test_public_url_rules(env, url):
@@ -108,9 +120,12 @@ def _netbox(**kwargs):
     return NetBoxConfig(netbox_url="https://netbox.test", token="t", **kwargs)
 
 
-def test_oauth_provider_validates_and_returns_none(oauth_config):
-    transport = TransportConfig(transport_type="http")
-    assert build_auth_provider(_netbox(), transport, oauth_config) is None
+async def test_oauth_provider_denies_every_token(oauth_config):
+    provider = build_auth_provider(
+        _netbox(), TransportConfig(transport_type="http"), oauth_config
+    )
+    assert isinstance(provider, TokenVerifier)
+    assert await provider.verify_token("anything") is None
 
 
 def test_oauth_excludes_passthrough_and_static_bearer(oauth_config):

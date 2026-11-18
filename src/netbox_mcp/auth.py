@@ -331,6 +331,13 @@ def rate_limit_client_id(_context: object) -> str:
     return access_token.client_id
 
 
+class DenyAllTokenVerifier(TokenVerifier):
+    """Rejects every token; keeps OAuth mode closed until its verifier exists."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:  # noqa: ARG002
+        return None
+
+
 def build_auth_provider(
     netbox_config: NetBoxConfig,
     transport_config: TransportConfig,
@@ -346,7 +353,8 @@ def build_auth_provider(
     Returns:
         AuthProvider | None: A NetBox token verifier with token passthrough, a
             static bearer token verifier with MCP_HTTP_BEARER_TOKEN, else None.
-            In OAuth mode None as well, until the OAuth verifier exists.
+            In OAuth mode a verifier that denies every token, until the
+            OAuth verifier exists.
 
     Raises:
         ValueError: If token passthrough is combined with stdio or with
@@ -366,7 +374,8 @@ def build_auth_provider(
             )
         if transport_config.transport_type != "http":
             raise ValueError("OIDC_ISSUER (OAuth mode) requires MCP_TRANSPORT=http")
-        return None
+        # Fail closed: `fastmcp run` imports server.py without calling main().
+        return DenyAllTokenVerifier()
 
     if netbox_config.token_passthrough:
         if transport_config.transport_type not in HTTP_TRANSPORTS:
