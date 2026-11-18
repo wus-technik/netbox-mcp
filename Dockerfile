@@ -32,8 +32,17 @@ LABEL org.opencontainers.image.title="NetBox MCP Server" \
       io.modelcontextprotocol.server.name="io.github.mhajder/netbox-mcp"
 ENV PYTHONUNBUFFERED=1
 
+# The server runs as UID/GID 10001. In OAuth mode it keeps an encrypted state
+# file that must persist: mount a volume at /data and set
+# OAUTH_STATE_PATH=/data/oauth-state.json (create the file once with
+# `oauth init`). /data is created owned by 10001, so a named volume inherits
+# that owner; a bind-mounted host directory must be writable for UID 10001.
+# No VOLUME instruction: the other modes need no state, and an anonymous
+# volume would hide a missing mount until the container is recreated.
 RUN addgroup -g 10001 appuser \
-    && adduser -D -u 10001 -G appuser appuser
+    && adduser -D -u 10001 -G appuser appuser \
+    && mkdir -p /data \
+    && chown 10001:10001 /data
 
 COPY --from=builder /app/.venv /app/.venv
 

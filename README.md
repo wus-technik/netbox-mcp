@@ -306,6 +306,8 @@ Every tool has a human-readable `title`, annotations, and returns a JSON object 
 
 ChatGPT cannot render a result whose data object has a key named `content`. In the structured result every `content` key, at any depth, is therefore renamed to `content_value`. This affects `netbox_render_config` (NetBox answers `{"content": "<rendered config>"}`) and any NetBox object that carries such a key in a nested field. The text content of the result keeps the NetBox data unchanged.
 
+After upgrading to a version with this change, remove and re-add an existing ChatGPT connector so ChatGPT picks up the new tool list.
+
 ## 🔒 Security & Safety Features
 
 ### Read-Only Mode
@@ -553,29 +555,9 @@ claude mcp add --transport http netbox https://netbox-mcp.example.com/mcp \
 - With `NETBOX_PLUGIN_DISCOVERY=true`, plugin types found with any user's token are added to one shared list. `rediscover` replaces that list with what the calling user can see, which drops uninstalled plugins; another user's call that names a type only they can see rediscovers it with their token.
 - Clients send their NetBox tokens to this server, so put it behind HTTPS.
 
-#### OAuth mode (work in progress)
+#### OAuth login
 
-Setting `OIDC_ISSUER` turns on OAuth mode, in which the server acts as its own OAuth authorization server and signs users in through an OpenID Connect identity provider. The server does not start in this mode yet; only the configuration is validated. A missing or invalid value stops startup and names the variable.
-
-| Variable | Required | Meaning |
-| --- | --- | --- |
-| `OIDC_ISSUER` | yes | Issuer URL of the identity provider; turns OAuth mode on |
-| `MCP_PUBLIC_URL` | yes | Public URL of the MCP endpoint, e.g. `https://mcp.example.com/mcp`. https (http only on loopback), no trailing slash, query or credentials |
-| `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | yes | Confidential client registered at the identity provider |
-| `OIDC_ALLOWED_GROUPS` | yes | Comma-separated groups whose members may sign in |
-| `NETBOX_TOKEN_BROKER_TOKEN` | yes | NetBox token of the service account that creates per-session user tokens |
-| `OAUTH_SIGNING_KEY` | yes | Base64 key that signs access tokens, at least 32 bytes decoded (`openssl rand -base64 32`) |
-| `OAUTH_STATE_KEY` | yes | Base64 key, exactly 32 bytes decoded, that encrypts the session store |
-| `OAUTH_STATE_PATH` | yes | File of the encrypted session store; its directory must exist |
-| `OIDC_USERNAME_CLAIM` | no | Claim holding the username (default `preferred_username`) |
-| `OIDC_GROUPS_CLAIM` | no | Claim holding the groups (default `groups`) |
-| `OIDC_EXTRA_SCOPES` | no | Extra scopes to request, comma-separated |
-| `EXTRA_REDIRECT_URIS`, `EXTRA_ORIGINS` | no | Extra allowed redirect URIs and web origins, comma-separated |
-| `NETBOX_USER_DENYLIST` | no | NetBox usernames that may never sign in, comma-separated |
-| `OAUTH_MAX_SESSION_DAYS` | no | Maximum age of a session in days, independent of the 30-day refresh window; afterwards the user signs in again (default `365`, at least `1`) |
-| `AUTH_DEBUG` | no | Log more detail about sign-ins, never secrets (default `false`) |
-
-OAuth mode needs `MCP_TRANSPORT=http` and cannot be combined with `NETBOX_TOKEN_PASSTHROUGH` or `MCP_HTTP_BEARER_TOKEN`. `NETBOX_TOKEN` is ignored.
+With `OIDC_ISSUER` set, the server signs users in through an OpenID Connect identity provider, acts as its own OAuth authorization server for the MCP clients and calls NetBox with a personal token per session. See [OAuth mode](#oauth-mode) for setup and operation.
 
 **Note**: The HTTP transport requires proper JSON-RPC formatting with `jsonrpc` and `id` fields. The server may also require session initialization for some operations.
 
@@ -591,6 +573,158 @@ curl http://localhost:8000/health
 ```
 
 For more information on FastMCP transports, see the [FastMCP documentation](https://gofastmcp.com/deployment/running-server#transport-protocols).
+
+## OAuth mode
+
+In OAuth mode remote MCP clients (claude.ai, the Claude desktop app, Claude Code, Codex CLI, ChatGPT) connect with a normal OAuth login, and every NetBox call runs **as the signed-in user**, with that user's NetBox permissions and changelog attribution. Users never copy a NetBox token into a client.
+
+The server is its own OAuth authorization server for the MCP clients (with Dynamic Client Registration, so no per-client setup) and signs users in through an OpenID Connect identity provider (IdP) as an ordinary confidential client. For each MCP session it creates a personal NetBox API token for the user through a NetBox service account, renews it, and deletes it when the session ends. The token never leaves the server.
+
+```text
+MCP client ──register / authorize / token / revoke──▶ netbox-mcp
+                                                        │ browser login
+                                                        ▼
+                                           OIDC IdP (code + PKCE, offline_access)
+                                                        │ identity + groups
+                                                        ▼
+                                    encrypted state file (sessions, tokens)
+                                                        │ service account
+                                                        ▼
+                                    NetBox: create / renew / delete the user's token
+MCP client ──Bearer (server-issued access token)──▶ /mcp ──▶ tools ──▶ NetBox as the user
+```
+
+### Deployment preconditions
+
+The server cannot check these; the deployment must guarantee them:
+
+- **NetBox accounts come from NetBox's own SSO login against the same IdP.** The server never creates NetBox users. A user who has never logged in to NetBox via SSO is denied with a hint to do that once.
+- **Users cannot change their own username at the IdP.** The username claim is mapped to the NetBox username; a self-chosen username could take over another NetBox account.
+- **Every local (non-SSO) NetBox account and every superuser is listed in `NETBOX_USER_DENYLIST`.** This is a required step, not an option. The NetBox REST API does not tell how an account authenticates, so a local account whose name matches an IdP username would otherwise be linked. The server also refuses superusers, but only if NetBox reports `is_superuser` in its users API, which current NetBox versions do not; until then the denylist is the only superuser guard. Names are compared case-insensitively.
+- **One server process.** The state file is locked by the running process; replicas are not supported.
+- **HTTPS in front of the server.** `MCP_PUBLIC_URL` must be `https` (plain `http` only on a loopback host for development). The reverse proxy passes requests through to the server's port.
+
+### Identity provider client
+
+Register a **confidential** OIDC client at the IdP:
+
+- Redirect URI: `<MCP_PUBLIC_URL>/oauth/callback`, e.g. `https://mcp.example.com/mcp/oauth/callback`.
+- Grant types: authorization code and refresh token. The server uses PKCE (S256), `state` and `nonce`.
+- Scopes: `openid profile email offline_access` (plus `OIDC_EXTRA_SCOPES`). **`offline_access` must be granted**: a login whose token response has no refresh token is denied, because every client refresh re-checks the user at the IdP.
+- ID tokens signed with RS256, audience = the client ID. The issuer and every endpoint in its discovery document must be `https`.
+- Userinfo must return the **groups claim** (`OIDC_GROUPS_CLAIM`, default `groups`) as a list. A user without the claim, or without a group from `OIDC_ALLOWED_GROUPS`, is denied.
+- The username claim (`OIDC_USERNAME_CLAIM`, default `preferred_username`) must be the claim NetBox's SSO uses as the NetBox username.
+
+### NetBox service account
+
+Create a dedicated, active NetBox user without administrative roles or inventory permissions, create a write-enabled token for it (`NETBOX_TOKEN_BROKER_TOKEN`), and grant exactly these object permissions:
+
+| Object type | Actions | Constraint |
+| --- | --- | --- |
+| `users.token` | `add`, `grant` | Optional, e.g. `{"user__groups__name": "<NetBox group of MCP users>"}` |
+| `users.token` | `view`, `delete` | None (cleanup and `sweep` must reach every token the server created) |
+| `users.user` | `view` | None |
+
+`grant` is the ObjectPermission action; NetBox forms the permission `users.grant_token` from it. Entering `grant_token` as the action forms the wrong permission. Restrict the service token to the server's egress address where possible.
+
+The per-session tokens are created with `write_enabled=true` (the user's own NetBox permissions are the limit), a lifetime of 7 days (renewed when less than 2 days remain), and the description `NetBox MCP (OAuth) <client name> <session prefix> <nonce>`.
+
+### Configuration
+
+Setting `OIDC_ISSUER` turns OAuth mode on. A missing or invalid value stops startup and names the variable.
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `OIDC_ISSUER` | yes | Issuer URL of the identity provider; turns OAuth mode on |
+| `MCP_PUBLIC_URL` | yes | Public URL of the MCP endpoint, e.g. `https://mcp.example.com/mcp`; issuer and resource of this server. https (http only on loopback), no trailing slash, query or credentials |
+| `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | yes | Confidential client registered at the identity provider |
+| `OIDC_ALLOWED_GROUPS` | yes | Comma-separated groups whose members may sign in |
+| `NETBOX_TOKEN_BROKER_TOKEN` | yes | NetBox token of the service account that creates per-session user tokens |
+| `OAUTH_SIGNING_KEY` | yes | Base64 key that signs access tokens, at least 32 bytes decoded (`openssl rand -base64 32`) |
+| `OAUTH_STATE_KEY` | yes | Base64 key, exactly 32 bytes decoded, that encrypts the state file (`openssl rand -base64 32`) |
+| `OAUTH_STATE_PATH` | yes | Path of the encrypted state file; its directory must exist and be writable |
+| `OIDC_USERNAME_CLAIM` | no | Claim holding the username (default `preferred_username`) |
+| `OIDC_GROUPS_CLAIM` | no | Claim holding the groups (default `groups`) |
+| `OIDC_EXTRA_SCOPES` | no | Extra scopes to request, comma-separated |
+| `EXTRA_REDIRECT_URIS`, `EXTRA_ORIGINS` | no | Extra allowed client redirect URIs (exact match) and web origins, comma-separated |
+| `NETBOX_USER_DENYLIST` | no in the parser, **required in practice** | NetBox usernames that may never sign in, comma-separated, case-insensitive: every local account and every superuser |
+| `OAUTH_MAX_SESSION_DAYS` | no | Maximum age of a session in days, independent of the 30-day refresh window; afterwards the user signs in again (default `365`, at least `1`) |
+| `AUTH_DEBUG` | no | Log more detail about sign-ins, never secrets (default `false`) |
+
+OAuth mode needs `MCP_TRANSPORT=http` and cannot be combined with `NETBOX_TOKEN_PASSTHROUGH` or `MCP_HTTP_BEARER_TOKEN`. `NETBOX_URL` is still required; `NETBOX_TOKEN` is ignored with a warning, because every call uses the session's own token.
+
+### First start
+
+1. Create the empty state file once, with the same `OAUTH_STATE_PATH` and `OAUTH_STATE_KEY` the server will use:
+
+   ```sh
+   netbox-mcp oauth init
+   ```
+
+   The server never creates the file itself: a missing, unreadable or undecryptable file (wrong path, lost volume, changed key) stops startup instead of silently starting empty.
+2. Start the server with `netbox-mcp` (the package entry point). OAuth mode cannot be started with `fastmcp run` or `fastmcp.json`; that refuses to start with a message.
+3. At startup the server opens the state file and fetches the IdP's discovery document. **If the IdP is unreachable at startup, the server does not start** (existing sessions are unavailable until it can); restart it once the IdP is back.
+4. Add the server to a client with the URL `MCP_PUBLIC_URL`, e.g. `claude mcp add --transport http netbox https://mcp.example.com/mcp`. The client registers itself, opens the browser for the IdP login and a one-time consent page per client registration, and then works without further interaction.
+
+**ChatGPT:** the tool results changed for ChatGPT (see [Tool results](#tool-results)); an existing ChatGPT connector must be removed and added again to pick up the new tool list.
+
+### Sessions and tokens
+
+- Access tokens are valid for 1 hour. Refresh tokens rotate on every use; a refresh window of 30 days slides with each client refresh, and a session ends at the latest `OAUTH_MAX_SESSION_DAYS` after its login.
+- **Every client refresh re-checks the user**: it refreshes the session's IdP token, reads the groups from userinfo, and checks that the NetBox user is active and the session's NetBox token still exists. Removing a user from the allowed groups at the IdP therefore ends access within about an hour (the next refresh gets `invalid_grant`).
+- Unavailable is not rejected: an IdP or NetBox that times out, answers 5xx/429 or HTML makes the refresh answer 503 `temporarily_unavailable`; the session and the previous refresh token stay valid and the client retries. One exception: if the IdP had already rotated its refresh token when the answer was lost, the next refresh fails closed (`invalid_grant`, the user logs in again). During an IdP outage clients lose access once their access token expires.
+- A refresh token presented again after it was rotated ends the session (a retry of the same refresh within 30 seconds gets the same answer instead).
+- A session also ends on revocation by the client, after 30 days without a refresh, when the NetBox user becomes inactive or is deleted, and when NetBox rejects the session's current token (for example because the user deleted it in NetBox). The tool call then returns a tool error asking to reconnect the client, and the next request gets 401, so the client logs in again. A 403 for a token that still exists is an ordinary NetBox permission error.
+- NetBox briefly unavailable during a session: the tool call returns a tool error, nothing ends, and the same session works again once NetBox is back.
+- Background jobs: hourly (and right after every session end) the server deletes the NetBox tokens of ended sessions and recovers tokens whose creation was interrupted; once a day it checks every session against NetBox, renews tokens due for renewal and removes client registrations unused for 30 days. A token that cannot be deleted for 7 days is logged as a warning once a day.
+
+### Endpoints and request rules
+
+- Discovery: protected-resource metadata at `/.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp` and `<base>/.well-known/oauth-protected-resource`; authorization-server metadata at `/.well-known/oauth-authorization-server[/mcp]`, `<base>/.well-known/oauth-authorization-server`, `/.well-known/openid-configuration/mcp` and `<base>/.well-known/openid-configuration`. There is deliberately no root `/.well-known/openid-configuration`, so a NetBox on the same host is not shadowed.
+- OAuth endpoints under `<base>/oauth/` (`register`, `authorize`, `token`, `revoke`, plus the IdP `callback` and the consent page), with root aliases `/register`, `/authorize`, `/token`, `/revoke` and `/oauth/revoke` for clients that ignore the base path. The only scope is `netbox`.
+- Redirect URIs a client may register: loopback `http://localhost:<port>/…` and `http://127.0.0.1:<port>/…`, the claude.ai/claude.com and ChatGPT callbacks, and `EXTRA_REDIRECT_URIS`.
+- Registration is rate-limited to 10 per minute per client address, with at most 1,000 stored registrations. The limit lives in memory, per process, and is keyed by the address of the TCP peer: **behind a reverse proxy all clients share one limit**.
+- `/mcp`: without a valid token every request gets 401 with a `WWW-Authenticate` challenge pointing at the metadata. Requests with an `Origin` header are only accepted from `https://claude.ai`, `https://claude.com`, `https://chatgpt.com`, the origin of `MCP_PUBLIC_URL` and `EXTRA_ORIGINS` (403 otherwise). FastMCP's own Host/Origin protection is switched off in OAuth mode; this allowlist is the only Origin check, and the `Host` header is not checked (set it at the reverse proxy). Only `POST` is served (`GET`/`DELETE` → 405); the transport is stateless.
+- `GET /health` answers without a token, as in the other HTTP modes.
+
+### Admin commands
+
+Offline commands that work on the state file directly. Each takes the file's lock, so they refuse to run while the server is running (exit code 2). Exit codes: `0` success, `1` error (usage, configuration, state file or NetBox failure), `2` state file locked. No command prints tokens, keys or state content.
+
+| Command | Purpose | Environment |
+| --- | --- | --- |
+| `netbox-mcp oauth init` | Create the empty encrypted state file; refuses an existing file. Works before the rest of the server configuration exists. | `OAUTH_STATE_PATH`, `OAUTH_STATE_KEY` |
+| `netbox-mcp oauth unlink <netbox-username>` | Remove the identity link of a NetBox user (e.g. after the IdP account was replaced). Also ends that user's sessions, queues their NetBox tokens for deletion and drops the user's consent grants and open logins. The tokens are deleted by the server's cleanup at its next start. | `OAUTH_STATE_PATH`, `OAUTH_STATE_KEY` |
+| `netbox-mcp oauth restore-reset` | End all sessions and queue their NetBox tokens (after a restore). Identity links, consent grants and client registrations stay. | `OAUTH_STATE_PATH`, `OAUTH_STATE_KEY` |
+| `netbox-mcp oauth sweep [--apply]` | List NetBox tokens with the description prefix `NetBox MCP (OAuth) ` that the state file does not track; dry run by default, `--apply` deletes them. Prints counts only. | as above plus `NETBOX_URL`, `NETBOX_TOKEN_BROKER_TOKEN` (optional `NETBOX_VERIFY_SSL`, `NETBOX_TIMEOUT`) |
+
+The first login of an IdP identity links it to the NetBox user ID. A later login of a different identity with the same username is denied and logged; it is never relinked automatically. Use `unlink` while the server is stopped to allow it.
+
+### Backup and restore
+
+Back up the state file and `OAUTH_STATE_KEY`, **stored separately**; the file is useless without the key, and the key must not travel with the file. The file contains client registrations, consent grants, identity links, sessions (with encrypted NetBox tokens and IdP refresh tokens) and the cleanup queue.
+
+To restore:
+
+1. Stop the server and put the backed-up file at `OAUTH_STATE_PATH` (same key).
+2. `netbox-mcp oauth restore-reset`: ends every restored session, so sessions revoked after the backup cannot come back. Users authorize again; links and consent grants stay.
+3. `netbox-mcp oauth sweep`, check the counts, then `netbox-mcp oauth sweep --apply`: deletes NetBox tokens created after the backup that the restored file does not know about.
+4. Start the server; its cleanup deletes the tokens queued in step 2.
+
+### Docker
+
+The image runs as UID/GID `10001` and creates `/data` owned by that user. Mount a persistent volume there and point `OAUTH_STATE_PATH` into it; with a bind mount, make the host directory writable for UID 10001:
+
+```sh
+docker run --rm -v netbox-mcp-state:/data --env-file .env ghcr.io/mhajder/netbox-mcp oauth init
+docker run -d -p 8000:8000 -v netbox-mcp-state:/data --env-file .env ghcr.io/mhajder/netbox-mcp
+```
+
+with `OAUTH_STATE_PATH=/data/oauth-state.json`. The image's entry point is `netbox-mcp`, so the admin commands are passed as arguments the same way (`oauth unlink <user>`, `oauth sweep`), while the server container is stopped.
+
+### Logging
+
+The HTTP access log is off in OAuth mode (request lines would contain `code` and `state`), and the HTTP client libraries log at WARNING only. The server logs its own events instead, e.g. `login_denied`, `token_refreshed`, `refresh_rejected` with a reason, `tool_call` and `session_ended`, with the NetBox username, client name, the first 8 characters of the session ID and the request path without query string. No tokens, codes, cookies or secrets are logged, also not with `AUTH_DEBUG=true`.
 
 ## 🤝 Contributing
 
