@@ -211,7 +211,16 @@ def _json_error(status: int, error: str, description: str) -> Response:
 
 
 class _BadRequest(Exception):  # noqa: N818 - internal control flow
-    """The token or revocation request body is unusable."""
+    """The token or revocation request body is unusable.
+
+    ``unambiguous`` holds the parameters that did have exactly one string
+    value, so a code grant can still burn its code (empty if the body could
+    not be parsed at all).
+    """
+
+    def __init__(self, reason: str, unambiguous: dict[str, str] | None = None):
+        super().__init__(reason)
+        self.unambiguous = unambiguous or {}
 
 
 async def _oauth_params(request: Request) -> dict[str, str]:
@@ -234,22 +243,20 @@ async def _oauth_params(request: Request) -> dict[str, str]:
             raise _BadRequest("body is not JSON") from None
         if not isinstance(body, dict):
             raise _BadRequest("body is not a JSON object")
-        params: dict[str, str] = {}
+        params = {k: v for k, v in body.items() if isinstance(v, str)}
         for key, value in body.items():
-            if value is None:
-                continue
-            if not isinstance(value, str):
-                raise _BadRequest(f"{key} must be a string")
-            params[key] = value
+            if value is not None and not isinstance(value, str):
+                raise _BadRequest(f"{key} must be a string", params)
         return params
     try:
         form = parse_qs(raw.decode("utf-8"), strict_parsing=False)
     except UnicodeDecodeError:
         raise _BadRequest("body is not UTF-8") from None
+    params = {key: values[0] for key, values in form.items() if len(values) == 1}
     for key, values in form.items():
         if len(values) > 1:
-            raise _BadRequest(f"{key} given more than once")
-    return {key: values[0] for key, values in form.items()}
+            raise _BadRequest(f"{key} given more than once", params)
+    return params
 
 
 Handler = Callable[[Request], Awaitable[Response]]
@@ -764,6 +771,16 @@ class OAuthEndpoints:
         try:
             params = await _oauth_params(request)
         except _BadRequest as exc:
+            partial = exc.unambiguous
+            code = partial.get("code")
+            if partial.get("grant_type") == "authorization_code" and code:
+                # Burned on the first attempt, also an unparseable one.
+                try:
+                    await self.manager.burn_code(code)
+                except StoreWriteError:
+                    return _json_error(
+                        503, "temporarily_unavailable", "the request was not stored"
+                    )
             return _json_error(400, "invalid_request", str(exc))
         grant_type = params.get("grant_type")
         try:

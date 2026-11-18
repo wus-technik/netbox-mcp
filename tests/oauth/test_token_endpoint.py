@@ -892,6 +892,54 @@ async def test_malformed_code_request_burns_code(http, store, fake_idp, drop) ->
     assert_error(await exchange(http, client_id, code), 400, "invalid_grant")
 
 
+@pytest.mark.parametrize("bad", ["json_number", "json_list", "duplicate_field"])
+async def test_unparseable_code_request_burns_code(http, store, fake_idp, bad) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    body = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client_id,
+        "redirect_uri": REDIRECT,
+        "code_verifier": VERIFIER,
+    }
+    if bad == "duplicate_field":
+        form = httpx2.QueryParams(body).add("redirect_uri", REDIRECT)
+        resp = await http.post(
+            TOKEN,
+            content=str(form),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+        )
+    else:
+        body["code_verifier"] = 7 if bad == "json_number" else [VERIFIER]
+        resp = await http.post(TOKEN, json=body)
+    assert_error(resp, 400, "invalid_request")
+    assert only_session(store).code_hash is None
+    assert_error(await exchange(http, client_id, code), 400, "invalid_grant")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # The code itself is ambiguous: nothing to burn.
+        "grant_type=authorization_code&code={c}&code=other",
+        # Not a code grant.
+        "grant_type=refresh_token&code={c}&refresh_token=a&refresh_token=b",
+    ],
+)
+async def test_unparseable_request_without_unambiguous_code_grant_keeps_code(
+    http, store, fake_idp, body
+) -> None:
+    client_id, code = await get_code(http, fake_idp)
+    resp = await http.post(
+        TOKEN,
+        content=body.format(c=code),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert_error(resp, 400, "invalid_request")
+    assert only_session(store).code_hash is not None
+    assert (await exchange(http, client_id, code)).status_code == 200
+
+
 async def code_with_resource(http, fake_idp, resource: str) -> tuple[str, str]:
     client_id = await register(http)
     resp = await http.get(
