@@ -72,7 +72,9 @@ def _decode_key(name: str, value: str) -> bytes:
         raise ValueError(f"{name} must be base64") from None
 
 
-def _check_public_url(name: str, value: str) -> str:
+def _check_url(name: str, value: str, *, trailing_slash: bool) -> str:
+    """Absolute https URL (http only on loopback), no credentials, query or
+    fragment; ``trailing_slash`` allows the path to end with ``/``."""
     try:
         parts = urlsplit(value)
         host = parts.hostname
@@ -89,9 +91,19 @@ def _check_public_url(name: str, value: str) -> str:
         raise ValueError(f"{name} must not contain credentials")
     if "?" in value or "#" in value:
         raise ValueError(f"{name} must not contain a query or fragment")
-    if parts.path.endswith("/"):
+    if not trailing_slash and parts.path.endswith("/"):
         raise ValueError(f"{name} must not end with a slash")
     return value
+
+
+def _check_public_url(name: str, value: str) -> str:
+    return _check_url(name, value, trailing_slash=False)
+
+
+def _check_issuer_url(name: str, value: str) -> str:
+    # Spec 5.1: the issuer must be https. It is compared exactly with the
+    # discovery document and the ID token, so a trailing slash is kept as is.
+    return _check_url(name, value, trailing_slash=True)
 
 
 def get_oauth_config_from_env() -> OAuthConfig | None:
@@ -104,6 +116,7 @@ def get_oauth_config_from_env() -> OAuthConfig | None:
     issuer = env_str("OIDC_ISSUER")
     if issuer is None:
         return None
+    issuer = _check_issuer_url("OIDC_ISSUER", issuer)
 
     public_url = _check_public_url(
         "MCP_PUBLIC_URL", _required("MCP_PUBLIC_URL", env_str("MCP_PUBLIC_URL"))

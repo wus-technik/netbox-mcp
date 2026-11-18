@@ -93,7 +93,9 @@ class FakeIdP:
         client_secret: str = "client-secret",
         *,
         now: Callable[[], float] = time.time,
+        issuer: str = ISSUER,
     ) -> None:
+        self.issuer = issuer
         self.client_id = client_id
         self.client_secret = client_secret
         self.now = now
@@ -206,7 +208,7 @@ class FakeIdP:
     # -- request handling
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
-        base = httpx2.URL(self.issuer).path
+        base = httpx2.URL(self.issuer).path.rstrip("/") + "/"
         route = path[len(base) :] if path.startswith(base) else None
         names = {
             ".well-known/openid-configuration": "discovery",
@@ -244,11 +246,11 @@ class FakeIdP:
             self._outcome("discovery", self.discovery_outcome), request
         ):
             return failed
-        i = self.issuer
+        i = self.issuer.rstrip("/") + "/"
         return httpx2.Response(
             200,
             json={
-                "issuer": i,
+                "issuer": self.issuer,
                 "authorization_endpoint": f"{i}authorize/",
                 "token_endpoint": f"{i}token/",
                 "userinfo_endpoint": f"{i}userinfo/",

@@ -148,8 +148,12 @@ class IdpClient:
     async def discover(self) -> None:
         """Fetch and validate the provider metadata (startup)."""
         issuer = self.config.issuer_url
+        # OIDC Discovery 1.0 section 4: strip a trailing slash, then append the
+        # well-known path. The configured issuer itself is compared exactly.
         resp = await self._send(
-            "GET", f"{issuer}.well-known/openid-configuration", what="discovery"
+            "GET",
+            issuer.rstrip("/") + "/.well-known/openid-configuration",
+            what="discovery",
         )
         if resp.status_code != 200:
             raise IdpUnavailable(f"discovery: HTTP {resp.status_code}")
@@ -167,6 +171,8 @@ class IdpClient:
             try:
                 parts = urlsplit(value) if value else None
                 valid = parts is not None and parts.scheme == "https" and parts.hostname
+                if parts is not None:
+                    _ = parts.port  # raises ValueError on an invalid port
             except ValueError:
                 valid = False
             if value is None or not valid:
@@ -322,7 +328,8 @@ class IdpClient:
         audience = claims["aud"]
         azp = claims.get("azp")
         multiple = isinstance(audience, list) and len(audience) > 1
-        if (multiple or azp is not None) and azp != self.config.client_id:
+        # A present azp must name this client, even when it is JSON null.
+        if (multiple or "azp" in claims) and azp != self.config.client_id:
             raise IdpRejected("id_token azp does not match the client")
         got = claims.get("nonce")
         if not isinstance(got, str) or not hmac.compare_digest(got, nonce):

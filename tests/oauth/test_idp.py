@@ -61,6 +61,30 @@ async def test_discovery_issuer_exact_trailing_slash(oauth_config, fake_idp) -> 
         await client.discover()
 
 
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "https://idp.example.com",
+        "https://idp.example.com/",
+        "https://idp.example.com/realms/main",
+        "https://idp.example.com/realms/main/",
+    ],
+)
+async def test_discovery_with_and_without_trailing_slash(
+    oauth_config, issuer, clock
+) -> None:
+    idp = FakeIdP(issuer=issuer, now=clock)
+    config = oauth_config.model_copy(update={"issuer_url": issuer})
+    client = IdpClient(config, transport=idp.transport)
+    await client.discover()
+    (request,) = idp.requests_to("discovery")
+    root = issuer.rstrip("/")
+    assert request.path == urlsplit(f"{root}/.well-known/openid-configuration").path
+    # The issuer is compared exactly, so the login still validates the ID token.
+    code = await _login_code(idp, client)
+    assert (await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")).sub
+
+
 async def test_discovery_rejects_http_endpoint(oauth_config) -> None:
     def handler(_request: httpx2.Request) -> httpx2.Response:
         i = oauth_config.issuer_url
@@ -425,6 +449,7 @@ def _custom_token(idp: FakeIdP, nonce: str = "n-1", **overrides):
         ({"aud": ["netbox-mcp", "other"], "azp": "other"}, False),
         ({"azp": "other"}, False),
         ({"azp": "netbox-mcp"}, True),
+        ({"azp": None}, False),
         ({"iat": "yesterday"}, False),
         ({"iat": None}, False),
         ({"iat": ...}, True),
@@ -479,7 +504,10 @@ async def test_jwk_with_matching_alg_and_use_accepted(
     assert (await client.exchange_code(code, VERIFIER, REDIRECT, "n-1")).sub
 
 
-@pytest.mark.parametrize("bad", ["https://", "https://[bad", "not a url", ""])
+@pytest.mark.parametrize(
+    "bad",
+    ["https://", "https://[bad", "not a url", "", "https://idp.example.com:bad/t/"],
+)
 async def test_discovery_malformed_url_is_unavailable(oauth_config, bad) -> None:
     def handler(_request: httpx2.Request) -> httpx2.Response:
         i = oauth_config.issuer_url

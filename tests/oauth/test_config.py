@@ -87,6 +87,41 @@ def test_public_url_accepts_loopback_http(env):
     assert get_oauth_config_from_env().base_path == "/mcp"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://idp.example.com/realm",
+        "ftp://idp.example.com/realm",
+        "idp.example.com/realm",
+        "https://u:p@idp.example.com/realm",
+        "https://idp.example.com/realm?a=1",
+        "https://idp.example.com/realm#x",
+        "https://idp.example.com:bad/realm",
+        "https://idp.exa mple.com/realm",
+        "https:///realm",
+    ],
+)
+def test_issuer_rules(env, url):
+    env.setenv("OIDC_ISSUER", url)
+    with pytest.raises(ValueError, match="OIDC_ISSUER"):
+        get_oauth_config_from_env()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://idp.example.com",
+        "https://idp.example.com/",
+        "https://idp.example.com/realms/main",
+        "https://idp.example.com/application/o/test/",
+        "http://localhost:8080/realms/dev",
+    ],
+)
+def test_issuer_accepted(env, url):
+    env.setenv("OIDC_ISSUER", url)
+    assert get_oauth_config_from_env().issuer_url == url
+
+
 @pytest.mark.parametrize(("size", "ok"), [(31, False), (32, True), (64, True)])
 def test_signing_key_min_32_bytes(env, size, ok):
     env.setenv("OAUTH_SIGNING_KEY", base64.b64encode(b"x" * size).decode())
