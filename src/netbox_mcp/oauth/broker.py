@@ -83,6 +83,7 @@ class TokenInfo:
     enabled: bool
     expires_at: float | None
     user_id: int | None
+    description: str = ""
 
 
 def _iso(ts: float) -> str:
@@ -122,6 +123,7 @@ def _token_info(row: Any) -> TokenInfo:
         enabled=bool(row.get("enabled")),
         expires_at=_parse_time(row.get("expires")),
         user_id=user_id if isinstance(user_id, int) else None,
+        description=str(row.get("description") or ""),
     )
 
 

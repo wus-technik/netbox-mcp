@@ -551,3 +551,91 @@ async def test_jobs_stop_awaits_tasks(manager):
     await jobs.stop()
     assert all(t.done() for t in tasks)
     await jobs.stop()  # idempotent
+
+
+# ------------------------------------------------------------- fix round 1
+
+
+async def test_expiry_rechecked_under_lock_after_refresh(manager, link, client, clock):
+    sid = await _session(manager, link, client)
+    clock.advance(30 * DAY)
+    async with manager.lock_for(sid):
+        task = asyncio.create_task(manager.end_expired())
+        await _settle()
+        assert not task.done()  # waiting on the session lock
+        async with manager.store.mutate() as state:  # a refresh extends the deadline
+            state.sessions[sid].refresh_deadline = clock() + 30 * DAY
+    await task
+    assert sid in manager.store.snapshot().sessions
+
+
+async def _blocked_create(manager):
+    """Make the next create_token POST block until released; returns controls."""
+    started, release = asyncio.Event(), asyncio.Event()
+    original = manager.broker.create_token
+
+    async def slow(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    manager.broker.create_token = slow
+    return started, release
+
+
+async def test_recovery_waits_for_in_flight_create(
+    manager, fake_netbox_tokens, link, client, clock
+):
+    started, release = await _blocked_create(manager)
+    create = asyncio.create_task(manager.create_session(link, client, "rt", **BINDING))
+    await started.wait()
+    clock.advance(700)  # the marker is now old enough for recovery
+    recovery = asyncio.create_task(manager.recover_pending())
+    await _settle()
+    assert not recovery.done()
+    assert fake_netbox_tokens.sent("GET", "tokens.list") == []
+    release.set()
+    session, _ = await create
+    await recovery
+    assert manager.store.snapshot().pending == {}
+    assert session.netbox_token_id in fake_netbox_tokens.tokens
+    assert session.sid in manager.store.snapshot().sessions
+
+
+async def test_recovery_waits_for_in_flight_renewal(
+    manager, fake_netbox_tokens, link, client, clock
+):
+    sid = await _session(manager, link, client)
+    clock.advance(6 * DAY)
+    started, release = await _blocked_create(manager)
+    renew = asyncio.create_task(manager.renew_if_due(sid))
+    await started.wait()
+    clock.advance(700)
+    recovery = asyncio.create_task(manager.recover_pending())
+    await _settle()
+    assert not recovery.done()
+    release.set()
+    await renew
+    await recovery
+    session = manager.store.snapshot().sessions[sid]
+    assert session.token_version == 2
+    assert session.netbox_token_id in fake_netbox_tokens.tokens
+    assert manager.store.snapshot().pending == {}
+
+
+async def test_recovery_ignores_decoy_descriptions(manager, fake_netbox_tokens, clock):
+    nonce = await _marker(manager, clock, age=700)
+    real = fake_netbox_tokens.add_token(
+        "alice", description=f"NetBox MCP x 12345678 {nonce}"
+    )
+    decoys = [
+        fake_netbox_tokens.add_token("alice", description=f"{nonce} trailing text"),
+        fake_netbox_tokens.add_token("alice", description=f"x{nonce}"),
+        fake_netbox_tokens.add_token(
+            "bob", description=f"NetBox MCP x 12345678 {nonce}"
+        ),
+    ]
+    await manager.recover_pending()
+    assert real["id"] not in fake_netbox_tokens.tokens
+    assert all(d["id"] in fake_netbox_tokens.tokens for d in decoys)
+    assert manager.store.snapshot().pending == {}

@@ -147,6 +147,13 @@ class SessionManager:
         """Per-session lock. Hold the returned lock while using it."""
         return self._lock(self._session_locks, sid)
 
+    def _netbox_user_lock(self, netbox_user_id: int) -> asyncio.Lock:
+        """Per-NetBox-user lock around token creation and recovery.
+
+        Lock order: session lock before this lock; never the reverse.
+        """
+        return self.user_lock(f"netbox-user|{netbox_user_id}")
+
     def user_lock(self, user_key: str) -> asyncio.Lock:
         """Per-user lock (login mapping, token recovery)."""
         return self._lock(self._user_locks, user_key)
@@ -314,47 +321,53 @@ class SessionManager:
         sid = uuid.uuid4().hex
         nonce = uuid.uuid4().hex
         now = token_time.now()
-        async with self.store.mutate() as state:
-            state.pending[nonce] = PendingCreate(
-                nonce=nonce, netbox_user_id=link.netbox_user_id, sid=sid, created_at=now
+        # Held across marker, POST and final write so recovery cannot run in
+        # between. Lock order everywhere: session lock, then NetBox-user lock.
+        async with self._netbox_user_lock(link.netbox_user_id):
+            async with self.store.mutate() as state:
+                state.pending[nonce] = PendingCreate(
+                    nonce=nonce,
+                    netbox_user_id=link.netbox_user_id,
+                    sid=sid,
+                    created_at=now,
+                )
+            try:
+                created = await self.broker.create_token(
+                    link.netbox_user_id,
+                    self._description(client.client_name, sid, nonce),
+                    now + NETBOX_TOKEN_TTL,
+                )
+            except BrokerAmbiguous:
+                logger.warning("oauth: token create outcome unknown sid=%s", sid[:8])
+                raise LoginFailed("NetBox token creation failed") from None
+            except BrokerDefinite:
+                await self._drop_marker(nonce)
+                logger.warning("oauth: token create refused sid=%s", sid[:8])
+                raise LoginFailed("NetBox refused to create a token") from None
+            now = token_time.now()  # after the POST, which may have taken a while
+            code = token_time.new_secret()
+            session = Session(
+                sid=sid,
+                user_key=link.user_key,
+                client_id=client.client_id,
+                netbox_user_id=link.netbox_user_id,
+                created_at=now,
+                code_hash=token_time.hash_secret(code),
+                code_expires_at=now + CODE_TTL,
+                code_redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                code_resource=resource,
+                refresh_deadline=now + REFRESH_TTL,
+                idp_refresh_token=idp_refresh_token,
+                last_idp_check_at=now,
+                netbox_token=created.bearer,
+                netbox_token_id=created.token_id,
+                netbox_token_expires_at=created.expires_at,
+                token_version=1,
             )
-        try:
-            created = await self.broker.create_token(
-                link.netbox_user_id,
-                self._description(client.client_name, sid, nonce),
-                now + NETBOX_TOKEN_TTL,
-            )
-        except BrokerAmbiguous:
-            logger.warning("oauth: token create outcome unknown sid=%s", sid[:8])
-            raise LoginFailed("NetBox token creation failed") from None
-        except BrokerDefinite:
-            await self._drop_marker(nonce)
-            logger.warning("oauth: token create refused sid=%s", sid[:8])
-            raise LoginFailed("NetBox refused to create a token") from None
-        now = token_time.now()  # after the POST, which may have taken a while
-        code = token_time.new_secret()
-        session = Session(
-            sid=sid,
-            user_key=link.user_key,
-            client_id=client.client_id,
-            netbox_user_id=link.netbox_user_id,
-            created_at=now,
-            code_hash=token_time.hash_secret(code),
-            code_expires_at=now + CODE_TTL,
-            code_redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            code_resource=resource,
-            refresh_deadline=now + REFRESH_TTL,
-            idp_refresh_token=idp_refresh_token,
-            last_idp_check_at=now,
-            netbox_token=created.bearer,
-            netbox_token_id=created.token_id,
-            netbox_token_expires_at=created.expires_at,
-            token_version=1,
-        )
-        async with self.store.mutate() as state:
-            state.sessions[sid] = session
-            state.pending.pop(nonce, None)
+            async with self.store.mutate() as state:
+                state.sessions[sid] = session
+                state.pending.pop(nonce, None)
         self._index_add(token_time.hash_secret(code), sid)
         logger.info("oauth session created sid=%s", sid[:8])
         return session.model_copy(deep=True), code
@@ -403,43 +416,45 @@ class SessionManager:
                 return
         client = snap.clients.get(session.client_id)
         name = client.client_name if client else session.client_id
-        nonce = uuid.uuid4().hex
-        async with self.store.mutate() as state:
-            state.pending[nonce] = PendingCreate(
-                nonce=nonce,
-                netbox_user_id=session.netbox_user_id,
-                sid=sid,
-                created_at=now,
-            )
-        try:
-            created = await self.broker.create_token(
-                session.netbox_user_id,
-                self._description(name, sid, nonce),
-                now + NETBOX_TOKEN_TTL,
-            )
-        except BrokerDefinite:
-            await self._drop_marker(nonce)
-            logger.warning("oauth: renewal refused sid=%s", sid[:8])
-            return
-        except (BrokerAmbiguous, BrokerUnavailable):
-            # Keep marker and current token; recovery handles the marker.
-            logger.warning("oauth: renewal failed sid=%s", sid[:8])
-            return
-        async with self.store.mutate() as state:
-            state.pending.pop(nonce, None)
-            stored = state.sessions.get(sid)
-            if stored is None:
-                self._enqueue(
-                    state, created.token_id, session.netbox_user_id, "orphaned"
+        # Lock order everywhere: session lock, then NetBox-user lock.
+        async with self._netbox_user_lock(session.netbox_user_id):
+            nonce = uuid.uuid4().hex
+            async with self.store.mutate() as state:
+                state.pending[nonce] = PendingCreate(
+                    nonce=nonce,
+                    netbox_user_id=session.netbox_user_id,
+                    sid=sid,
+                    created_at=now,
                 )
-            else:
-                self._enqueue(
-                    state, stored.netbox_token_id, stored.netbox_user_id, "renewed"
+            try:
+                created = await self.broker.create_token(
+                    session.netbox_user_id,
+                    self._description(name, sid, nonce),
+                    now + NETBOX_TOKEN_TTL,
                 )
-                stored.netbox_token = created.bearer
-                stored.netbox_token_id = created.token_id
-                stored.netbox_token_expires_at = created.expires_at
-                stored.token_version += 1
+            except BrokerDefinite:
+                await self._drop_marker(nonce)
+                logger.warning("oauth: renewal refused sid=%s", sid[:8])
+                return
+            except (BrokerAmbiguous, BrokerUnavailable):
+                # Keep marker and current token; recovery handles the marker.
+                logger.warning("oauth: renewal failed sid=%s", sid[:8])
+                return
+            async with self.store.mutate() as state:
+                state.pending.pop(nonce, None)
+                stored = state.sessions.get(sid)
+                if stored is None:
+                    self._enqueue(
+                        state, created.token_id, session.netbox_user_id, "orphaned"
+                    )
+                else:
+                    self._enqueue(
+                        state, stored.netbox_token_id, stored.netbox_user_id, "renewed"
+                    )
+                    stored.netbox_token = created.bearer
+                    stored.netbox_token_id = created.token_id
+                    stored.netbox_token_expires_at = created.expires_at
+                    stored.token_version += 1
         self.cleanup_wanted.set()
 
     async def end_session(self, sid: str, reason: str) -> None:
@@ -1036,12 +1051,21 @@ class SessionManager:
         marker = self.store.snapshot().pending.get(nonce)
         if marker is None:
             return
-        async with self.user_lock(f"netbox-user|{marker.netbox_user_id}"):
+        async with self._netbox_user_lock(marker.netbox_user_id):
             marker = self.store.snapshot().pending.get(nonce)
             if marker is None or token_time.now() - marker.created_at < MARKER_MIN_AGE:
                 return
             try:
                 found = await self.broker.list_tokens(marker.netbox_user_id, nonce)
+                # list_tokens matches substrings; delete only tokens that carry
+                # the nonce as the description's last word and belong to the
+                # marker's user.
+                found = [
+                    t
+                    for t in found
+                    if t.user_id == marker.netbox_user_id
+                    and t.description.endswith(" " + nonce)
+                ]
                 for info in found:
                     await self.broker.delete_token(info.id)
             except BrokerError:
@@ -1073,15 +1097,24 @@ class SessionManager:
         now = token_time.now()
         cap = self.config.max_session_days * 86400
         for session in list(self.store.snapshot().sessions.values()):
-            if now >= session.refresh_deadline:
-                reason = "expired"
-            elif now - session.created_at >= cap:
-                reason = "max_age"
-            else:
+            if self._expiry_reason(session, now, cap) is None:
                 continue
             async with self.lock_for(session.sid):
-                if session.sid in self.store.snapshot().sessions:
+                # A refresh may have moved the deadline while we waited.
+                current = self.store.snapshot().sessions.get(session.sid)
+                if current is None:
+                    continue
+                reason = self._expiry_reason(current, token_time.now(), cap)
+                if reason is not None:
                     await self._end_guarded(session.sid, reason)
+
+    @staticmethod
+    def _expiry_reason(session: Session, now: float, cap: float) -> str | None:
+        if now >= session.refresh_deadline:
+            return "expired"
+        if now - session.created_at >= cap:
+            return "max_age"
+        return None
 
     async def _end_guarded(
         self, sid: str, reason: str, *, drop_grants: bool = False
