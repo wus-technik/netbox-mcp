@@ -125,7 +125,9 @@ def _write_atomic(path: Path, data: bytes, *, overwrite: bool = True) -> None:
             tmp.replace(path)
         else:
             os.link(tmp, path)
-            tmp.unlink()
+            # Published; a leftover temp file must not turn this into a failure.
+            with contextlib.suppress(OSError):
+                tmp.unlink()
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -218,7 +220,9 @@ class StateStore:
         return cls(path, key, state, lock_fd)
 
     def snapshot(self) -> OAuthState:
-        """Deep copy of the current state."""
+        """Deep copy of the current state; refused after an uncertain commit."""
+        if self._failed:
+            raise StoreError("state store failed; reopen required")
         return self._state.model_copy(deep=True)
 
     @contextlib.asynccontextmanager
@@ -264,6 +268,9 @@ class StateStore:
 
     async def aclose(self) -> None:
         """Release the lock after any in-flight mutate has finished."""
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            raise StoreError("aclose() inside mutate() would deadlock")
         async with self._mutex:
             self._release()
 

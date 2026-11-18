@@ -409,3 +409,54 @@ def test_lock_errno_mapping(
     with pytest.raises(StoreError) as exc:
         StateStore.open(path, KEY)
     assert isinstance(exc.value, StoreLocked) is locked
+
+
+@pytest.mark.asyncio
+async def test_snapshot_refused_after_uncertain_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    StateStore.create(path, KEY)
+    s = StateStore.open(path, KEY)
+
+    def bad_fsync_dir(_d: Path) -> None:
+        raise OSError("io error")
+
+    monkeypatch.setattr(store_module, "_fsync_dir", bad_fsync_dir)
+    try:
+        with pytest.raises(StoreWriteError):
+            async with s.mutate() as state:
+                state.clients["c1"] = _client()
+        with pytest.raises(StoreError, match="reopen"):
+            s.snapshot()
+    finally:
+        s.close()
+
+
+@pytest.mark.asyncio
+async def test_aclose_inside_mutate_raises_instead_of_deadlocking(
+    store: StateStore,
+) -> None:
+    async def inner() -> None:
+        async with store.mutate():
+            await store.aclose()
+
+    with pytest.raises(StoreError, match="aclose"):
+        await asyncio.wait_for(inner(), timeout=2)
+
+
+def test_create_survives_tmp_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "state.bin"
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self: Path, *a: object, **k: object) -> None:
+        if self.name.endswith(".tmp"):
+            raise OSError(errno.EACCES, "busy")
+        real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    StateStore.create(path, KEY)
+    monkeypatch.undo()
+    StateStore.open(path, KEY).close()
