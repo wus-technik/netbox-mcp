@@ -52,7 +52,7 @@ def test_access_token_claims(oauth_config, clock):
     assert claims["client_id"] == "c1"
     assert claims["scope"] == "netbox"
     assert claims["exp"] - claims["iat"] == 3600
-    assert abs(claims["iat"] - clock()) <= 2
+    assert claims["iat"] == int(clock())
     assert claims["jti"]
     assert tokens.verify(token)["sid"] == "s1"
 

@@ -36,13 +36,14 @@ def oauth_config(tmp_path: Path) -> OAuthConfig:
 
 
 class Clock:
-    """Time source offset from the real clock; ``advance`` moves it forward."""
+    """Frozen time source sampled once from the real clock; ``advance`` moves it."""
 
     def __init__(self) -> None:
+        self.base = time.time()
         self.offset = 0.0
 
     def __call__(self) -> float:
-        return time.time() + self.offset
+        return self.base + self.offset
 
     def advance(self, seconds: float) -> None:
         self.offset += seconds
