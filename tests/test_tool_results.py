@@ -35,6 +35,18 @@ def test_rename_content_keys_is_recursive():
     }
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"content": "c", "content_value": "v"},
+        {"content_value": "v", "content": "c"},
+    ],
+)
+def test_rename_content_keys_keeps_both_values_on_collision(data):
+    renamed = rename_content_keys({"nested": [data]})
+    assert renamed == {"nested": [{"content": "c", "content_value": "v"}]}
+
+
 def test_rename_content_keys_passes_scalars_and_lists_through():
     assert rename_content_keys([1, "x", None]) == [1, "x", None]
     assert rename_content_keys("content") == "content"
@@ -57,9 +69,8 @@ async def test_every_tool_has_title_annotations_and_object_output_schema(
         auto_title = tool.name.replace("_", " ").title()
         assert tool.title != auto_title, tool.name
         assert tool.annotations is not None, tool.name
-        assert tool.outputSchema is None or tool.outputSchema["type"] == "object", (
-            tool.name
-        )
+        schema = tool.output_schema
+        assert schema is None or schema["type"] == "object", tool.name
 
 
 async def test_list_tool_structured_content_is_object_and_text_unchanged(

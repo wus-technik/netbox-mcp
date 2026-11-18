@@ -109,6 +109,9 @@ BriefArg = Annotated[
 def rename_content_keys(value: Any) -> Any:
     """Rename every dict key ``content`` to ``CONTENT_KEY_RENAME``, recursively.
 
+    A dict that already has a ``CONTENT_KEY_RENAME`` key keeps its ``content``
+    key as is, so neither value is lost.
+
     Args:
         value: Any JSON-like value.
 
@@ -116,10 +119,11 @@ def rename_content_keys(value: Any) -> Any:
         Any: A copy with the keys renamed; scalars are returned unchanged.
     """
     if isinstance(value, dict):
+        rename = CONTENT_KEY_RENAME not in value
         return {
-            (CONTENT_KEY_RENAME if key == "content" else key): rename_content_keys(
-                child
-            )
+            (
+                CONTENT_KEY_RENAME if rename and key == "content" else key
+            ): rename_content_keys(child)
             for key, child in value.items()
         }
     if isinstance(value, list):
