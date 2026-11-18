@@ -7,6 +7,7 @@ Provides a Model Context Protocol (MCP) server exposing tools that interact with
 
 import logging
 import os
+import sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from urllib.parse import urlparse
@@ -227,6 +228,13 @@ def run_oauth(oauth_config: OAuthConfig) -> None:
 
 
 def main():
+    # First, before any transport or token check: the admin commands need only
+    # their own settings and must work without MCP_TRANSPORT=http.
+    if sys.argv[1:2] == ["oauth"]:
+        from netbox_mcp.oauth.cli import oauth_cli
+
+        raise SystemExit(oauth_cli(sys.argv[2:]))
+
     # A typo must not fall back to stdio: the HTTP port would never open while
     # the container healthcheck, which skips non-HTTP transports, kept reporting
     # healthy. Checked here rather than at import, because `fastmcp run` imports
