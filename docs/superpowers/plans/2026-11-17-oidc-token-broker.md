@@ -1,5 +1,9 @@
 # OIDC token broker implementation plan
 
+**Superseded** on 2026-11-18 by
+[OAuth authorization server implementation plan](2026-11-18-oauth-authorization-server.md).
+Do not execute.
+
 Status: proposed work, not an implemented or verified feature. **Blocked** until
 Task 0 passes: every task below requires a released Authentik version that
 provides RFC 8707 resource indicators and required PKCE S256 natively (design,
