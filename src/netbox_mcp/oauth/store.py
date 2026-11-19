@@ -17,7 +17,7 @@ import re
 import secrets
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -271,7 +271,7 @@ class StateStore:
         return self._state.model_copy(deep=True)
 
     @contextlib.asynccontextmanager
-    async def mutate(self) -> AsyncIterator[OAuthState]:
+    async def mutate(self) -> AsyncGenerator[OAuthState]:
         """Serialized read-modify-write; persists on clean exit.
 
         On an exception in the body the changes are discarded and the exception

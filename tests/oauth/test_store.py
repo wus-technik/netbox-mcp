@@ -192,7 +192,7 @@ async def test_write_is_atomic_tmp_in_same_dir(
     fsyncs: list[int] = []
     real_replace, real_fsync = os.replace, os.fsync
 
-    def spy_replace(src: object, dst: object) -> None:
+    def spy_replace(src: os.PathLike[str] | str, dst: os.PathLike[str] | str) -> None:
         replaced.append((str(src), str(dst)))
         real_replace(src, dst)
 
@@ -235,7 +235,7 @@ async def test_file_and_directory_are_fsynced_separately(
         )
         real_fsync(fd)
 
-    def spy_replace(a: object, b: object) -> None:
+    def spy_replace(a: os.PathLike[str] | str, b: os.PathLike[str] | str) -> None:
         calls.append("replace")
         real_replace(a, b)
 
@@ -451,10 +451,10 @@ def test_create_survives_tmp_cleanup_failure(
     path = tmp_path / "state.bin"
     real_unlink = Path.unlink
 
-    def flaky_unlink(self: Path, *a: object, **k: object) -> None:
+    def flaky_unlink(self: Path, missing_ok: bool = False) -> None:
         if self.name.endswith(".tmp"):
             raise OSError(errno.EACCES, "busy")
-        real_unlink(self, *a, **k)
+        real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", flaky_unlink)
     StateStore.create(path, KEY)
@@ -515,11 +515,11 @@ async def test_replace_retries_transient_permission_error(
         real_replace = os.replace
         calls: list[int] = []
 
-        def flaky(src: object, dst: object) -> None:
+        def flaky(src: os.PathLike[str] | str, dst: os.PathLike[str] | str) -> None:
             calls.append(1)
             if len(calls) <= 2:
                 raise PermissionError(errno.EACCES, "sharing violation")
-            real_replace(src, dst)  # type: ignore[arg-type]
+            real_replace(src, dst)
 
         monkeypatch.setattr(store_module, "_is_windows", lambda: True)
         monkeypatch.setattr(store_module.time, "sleep", lambda _s: None)

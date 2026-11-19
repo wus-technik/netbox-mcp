@@ -6,11 +6,18 @@ from fastmcp.server.auth.auth import TokenVerifier
 from netbox_mcp.auth import build_auth_provider
 from netbox_mcp.models import NetBoxConfig
 from netbox_mcp.models import TransportConfig
+from netbox_mcp.oauth.config import OAuthConfig
 from netbox_mcp.oauth.config import get_oauth_config_from_env
 
 from .conftest import OAUTH_ENV
 
 REQUIRED = [name for name in OAUTH_ENV if name != "OIDC_ISSUER"] + ["OAUTH_STATE_PATH"]
+
+
+def _config() -> OAuthConfig:
+    config = get_oauth_config_from_env()
+    assert config is not None
+    return config
 
 
 @pytest.fixture
@@ -29,6 +36,7 @@ def test_unset_issuer_returns_none(monkeypatch):
 @pytest.mark.usefixtures("env")
 def test_valid_env_and_defaults():
     config = get_oauth_config_from_env()
+    assert config is not None
     assert config.base_path == "/mcp"
     assert config.username_claim == "preferred_username"
     assert config.groups_claim == "groups"
@@ -51,6 +59,7 @@ def test_optional_values(env):
     env.setenv("NETBOX_USER_DENYLIST", "root,svc")
     env.setenv("AUTH_DEBUG", "true")
     config = get_oauth_config_from_env()
+    assert config is not None
     assert config.allowed_groups == ["a", "b"]
     assert config.user_denylist == {"root", "svc"}
     assert config.auth_debug is True
@@ -84,7 +93,7 @@ def test_public_url_rules(env, url):
 
 def test_public_url_accepts_loopback_http(env):
     env.setenv("MCP_PUBLIC_URL", "http://127.0.0.1:8000/mcp")
-    assert get_oauth_config_from_env().base_path == "/mcp"
+    assert _config().base_path == "/mcp"
 
 
 @pytest.mark.parametrize(
@@ -119,7 +128,7 @@ def test_issuer_rules(env, url):
 )
 def test_issuer_accepted(env, url):
     env.setenv("OIDC_ISSUER", url)
-    assert get_oauth_config_from_env().issuer_url == url
+    assert _config().issuer_url == url
 
 
 @pytest.mark.parametrize(("size", "ok"), [(31, False), (32, True), (64, True)])
@@ -182,9 +191,9 @@ def test_oauth_requires_http_transport(oauth_config, kind):
 
 def test_max_session_days_default_and_override(env):
     env.delenv("OAUTH_MAX_SESSION_DAYS", raising=False)
-    assert get_oauth_config_from_env().max_session_days == 365
+    assert _config().max_session_days == 365
     env.setenv("OAUTH_MAX_SESSION_DAYS", "1")
-    assert get_oauth_config_from_env().max_session_days == 1
+    assert _config().max_session_days == 1
 
 
 @pytest.mark.parametrize("value", ["0", "-5", "abc"])

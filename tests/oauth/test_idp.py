@@ -423,7 +423,9 @@ def _custom_token(idp: FakeIdP, nonce: str = "n-1", **overrides):
 
     from tests.oauth.fakes import _rsa_key
 
-    def build(username, _nonce):
+    fixed_nonce = nonce
+
+    def build(username: str, nonce: str | None) -> str:  # noqa: ARG001
         now = int(idp.now())
         claims = {
             "iss": idp.issuer,
@@ -432,7 +434,7 @@ def _custom_token(idp: FakeIdP, nonce: str = "n-1", **overrides):
             "preferred_username": username,
             "iat": now,
             "exp": now + 3600,
-            "nonce": nonce,
+            "nonce": fixed_nonce,
             **overrides,
         }
         claims = {k: v for k, v in claims.items() if v is not ...}

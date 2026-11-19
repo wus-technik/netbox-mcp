@@ -266,7 +266,9 @@ async def test_find_user_ignores_inexact_username_rows() -> None:
 @pytest.mark.parametrize(
     ("status", "error"), [(400, BrokerDefinite), (500, BrokerAmbiguous)]
 )
-async def test_create_errors_drop_response_body(status: int, error: type) -> None:
+async def test_create_errors_drop_response_body(
+    status: int, error: type[BaseException]
+) -> None:
     def handler(_request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(status, json={"detail": "SECRET-BODY-TEXT"})
 

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from collections.abc import AsyncGenerator
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -44,7 +45,7 @@ BASE = "https://mcp.example.com"
 
 
 @contextlib.asynccontextmanager
-async def idle_background(_manager: SessionManager) -> AsyncIterator[None]:
+async def idle_background(_manager: SessionManager) -> AsyncGenerator[None]:
     """No background jobs: these tests inspect the cleanup queue themselves."""
     yield
 
@@ -85,7 +86,7 @@ class ToolTransport:
 
 
 @contextlib.asynccontextmanager
-async def running(app) -> AsyncIterator[None]:
+async def running(app) -> AsyncGenerator[None]:
     """Run the app's lifespan in its own task.
 
     The FastMCP lifespan holds an anyio task group, which must be left in the
