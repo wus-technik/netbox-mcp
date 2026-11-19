@@ -11,6 +11,8 @@ from typing import Any
 
 from fastmcp.exceptions import DisabledError
 from fastmcp.exceptions import NotFoundError
+from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from fastmcp.tools import Tool
 from fastmcp.tools import ToolResult
@@ -20,6 +22,8 @@ from mcp_types import INVALID_PARAMS
 from pydantic import Field
 
 from netbox_mcp.models import NetBoxConfig
+from netbox_mcp.netbox_client import SESSION_ENDED_CLAIM
+from netbox_mcp.netbox_client import SESSION_ENDED_MESSAGE
 from netbox_mcp.netbox_client import NetBoxClient
 
 READ_ONLY_TAG = "read-only"
@@ -145,6 +149,22 @@ class UnknownToolIsInvalidParams(Middleware):
             raise MCPError(
                 INVALID_PARAMS, f"Unknown tool: {context.message.name!r}"
             ) from e
+
+
+class SessionEndedMiddleware(Middleware):
+    """Fail every tool call once the OAuth session ended while it was checked.
+
+    The verifier marks such a call's access token; ``NetBoxClient`` refuses it,
+    but a tool that never opens a client would still succeed. This check runs
+    before any tool and does nothing without the marker (stdio, passthrough and
+    static-token modes never carry it).
+    """
+
+    async def on_call_tool(self, context, call_next):
+        access_token = get_access_token()
+        if access_token is not None and access_token.claims.get(SESSION_ENDED_CLAIM):
+            raise ToolError(SESSION_ENDED_MESSAGE)
+        return await call_next(context)
 
 
 def _structured(fn: Callable[..., Any]) -> Callable[..., Any]:

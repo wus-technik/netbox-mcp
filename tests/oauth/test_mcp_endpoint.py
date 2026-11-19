@@ -481,6 +481,25 @@ async def test_token_gone_in_netbox_while_renewal_due_ends_session(env, clock, c
     assert len(e.netbox.sent("POST", "tokens.create")) == created
 
 
+async def test_ended_session_fails_tool_without_netbox_client(env, clock):
+    """A tool that never opens a NetBox client fails on the ending call too."""
+    e, _ = env
+    await login(e)
+    old = e.session()
+    clock.advance(5 * DAY + 60)  # renewal due
+    token, _ = AccessTokens(e.config).issue(old.sid, old.user_key, old.client_id)
+    e.netbox.delete_token(old.netbox_token_id)
+    call = rpc("tools/call", {"name": "netbox_list_object_types", "arguments": {}}, 1)
+
+    resp = await post(e.http, call, token)
+
+    assert is_tool_error(resp)
+    assert "reconnect" in resp.json()["result"]["content"][0]["text"]
+    assert e.tool_requests == []
+    again = await post(e.http, call, token)
+    assert again.status_code == 401
+
+
 async def test_token_check_unavailable_while_renewal_due_keeps_token(env, clock):
     e, _ = env
     await login(e)
