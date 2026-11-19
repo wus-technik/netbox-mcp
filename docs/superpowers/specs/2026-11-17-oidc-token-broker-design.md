@@ -5,45 +5,41 @@ Status: **superseded** on 2026-11-18 by
 Kept for its NetBox permission, broker-client and lifecycle analysis.
 
 Former status: proposed design; implementation and integration tests are outstanding.
-**Blocked** until an Authentik release provides the features listed under
+**Blocked** until a released IdP version provides the features listed under
 "Provider prerequisite" below.
 
 Implementation plan: [OIDC token broker implementation](../plans/2026-11-17-oidc-token-broker.md).
 Code baseline: upstream `v0.3.0`. The repository lockfile selects FastMCP 4.1.6
-and MCP Python SDK 2.3.0. NetBox 4.7.3 and Authentik 2026.8.5 are reference
-versions for the API contracts below, not an inventory of any deployment.
-Authentik 2026.8.5 does **not** meet the provider prerequisite. It is the
-version the current behaviour was analysed on, not a supported target.
+and MCP Python SDK 2.3.0. NetBox 4.7.3 is the reference version for the API
+contracts below, not an inventory of any deployment. The IdP version the
+current behaviour was analysed on does **not** meet the provider prerequisite
+and is not a supported target.
 
 All service URLs, account names, group names and deployment paths in examples
 are placeholders. No particular organization, infrastructure platform or
 existing permission configuration is assumed.
 
-## Provider prerequisite: a released Authentik version
+## Provider prerequisite: a released IdP version
 
-**Every implementation step of this design requires a released Authentik
-version that natively provides both of the following features.** This applies
+**Every implementation step of this design requires a released IdP version
+that natively provides both of the following features.** This applies
 to the Phase A experiments, the package implementation (Phase B) and every
 deployment (Phase C):
 
 1. **Resource indicators (RFC 8707):** the provider accepts `resource` on the
    authorization and token requests, restricts it to configured allowed
    resources, issues the access token with `aud` set to the MCP resource URI, and
-   preserves (or only narrows) it on refresh. Upstream:
-   [issue #27645](https://github.com/goauthentik/authentik/issues/27645),
-   [PR #27855](https://github.com/goauthentik/authentik/pull/27855).
+   preserves (or only narrows) it on refresh.
 2. **Required PKCE with S256 only:** a provider setting that rejects
    authorization requests without a code challenge, for confidential clients as
-   well, and disallows `plain`. Upstream:
-   [issue #25520](https://github.com/goauthentik/authentik/issues/25520),
-   [PR #27884](https://github.com/goauthentik/authentik/pull/27884).
+   well, and disallows `plain`.
 
 Rules:
 
 - **Only a published release counts:** a tagged version with release notes. A
   merged pull request, the `main` branch, a release candidate, a beta or a
   nightly image does not satisfy the prerequisite, and neither does a planned
-  milestone (both items are milestoned for 2027.2.0 as of 2026-11-17, unmerged).
+  milestone (as of 2026-11-17 neither feature was merged in the IdP's upstream).
 - **Check before starting work:** before any implementation work begins, check
   that the release contains each feature. Read its release notes and the provider
   settings in its documentation, and confirm the merged pull requests are in
@@ -51,8 +47,7 @@ Rules:
 - **Test the release itself:** Phase A tests must then show that the release
   behaves as required. The release notes alone are not proof.
 - **Minimum version:** that release becomes the minimum supported provider
-  version. Replace the Authentik reference version in this document and in the
-  source links of section 10 with it.
+  version. Replace the reference IdP version in this document with it.
 - **Every deployment:** check that the production provider runs at least the
   minimum version before deploying, and again before each provider upgrade or
   downgrade.
@@ -155,9 +150,9 @@ disallowed in the native provider setting, discovery is expected to list only
 `S256`; record what the minimum release actually advertises. Enforcement is
 proven by the negative probes below, not by discovery.
 
-Authentik releases up to and including 2026.8.5 advertise `plain` and `S256`,
-accept an authorization request without a challenge, and check the verifier
-only when a challenge was recorded. They cannot meet this requirement. Use the
+The IdP version analysed for this design advertises `plain` and `S256`,
+accepts an authorization request without a challenge, and checks the verifier
+only when a challenge was recorded. It cannot meet this requirement. Use the
 native PKCE setting of the minimum provider release (see "Provider
 prerequisite"), set to require PKCE for all clients with `plain` disallowed. An
 expression policy is not an accepted substitute. Record and test the
@@ -190,7 +185,7 @@ First-login linking is therefore only safe under these preconditions:
 
 - **Operator-controlled namespace (deployment precondition):** only
   administrators can set or change the username claim in the provider. Users must
-  not be able to edit their own username (in Authentik: no self-service username
+  not be able to edit their own username (in the IdP: no self-service username
   change in the user settings flow, and no enrollment flow that lets users choose
   a name matching an existing NetBox account). The provider's username and the
   NetBox username must come from the same administered source, for example the
@@ -221,7 +216,7 @@ that tells them apart; Phase A must confirm it with real tokens.
 **Authorization-server metadata discovery.** The reference issuer has a path and
 a trailing slash. RFC 8414 places metadata at the path-inserted form
 `https://identity.example.com/.well-known/oauth-authorization-server/application/o/inventory-mcp/`,
-while Authentik serves only the appended OIDC form
+while the analysed IdP serves only the appended OIDC form
 `https://identity.example.com/application/o/inventory-mcp/.well-known/openid-configuration`.
 Under MCP 2025-11-25, clients try the path-inserted OAuth and OIDC forms first
 and the appended OIDC form last. Phase A must record, per client, which URL it
@@ -232,15 +227,15 @@ the configured issuer exactly, including the trailing slash.
 broker is implemented.
 
 1. **Release check.** Confirm the "Provider prerequisite" (top of this document)
-   against a published Authentik release.
+   against a published IdP release.
 2. **Behaviour check.** Prove the resource contract and PKCE enforcement with
    real authorization, code-exchange and refresh requests against that release.
 
 A successful login with a client-ID-only audience does not pass this gate.
 
-**Decision (2026-11-17): wait for native support in a released Authentik
-version.** Released Authentik versions up to 2026.8.5 fail the gate, and both
-features are targeted at 2027.2.0 but not merged (see "Upstream status" below).
+**Decision (2026-11-17): wait for native support in a released IdP
+version.** The released IdP versions available at the time fail the gate, and
+neither feature was merged upstream (see "Upstream status" below).
 No phase of this plan starts before such a release exists and has passed both
 stages.
 
@@ -248,42 +243,43 @@ The following are explicitly not pursued while waiting:
 
 - Switching to a different identity provider.
 - Adding an OAuth proxy.
-- Building a patched Authentik.
+- Building a patched IdP.
 
 Changing that requires a new decision and a revised design.
 
 Also not acceptable as workarounds:
 
-- **Authentik token exchange (RFC 8693, since 2026.8.0).** Its `audience`
+- **IdP token exchange (RFC 8693).** In the analysed IdP its `audience`
   parameter accepts only a target provider's client ID or application UUID, so
   the issued `aud` is a client ID, not the MCP resource URI; `resource` is
   rejected with `invalid_target`.
 - **Returning `aud` from a scope mapping.** The same claims feed the ID token, so
-  the mapping also overwrites the ID token's `aud` (confirmed upstream bug). The
+  the mapping also overwrites the ID token's `aud` (a confirmed upstream bug in
+  the analysed IdP). The
   documented workaround `["<resource>", client_id]` puts the resource into the ID
   token's audience as well, which removes the separation this design relies on.
 - **An expression policy enforcing PKCE.** It would emulate the missing provider
   setting without the token-endpoint enforcement and discovery change of the
   native feature.
 
-### Upstream status (Authentik, checked 2026-11-17)
+### Upstream status (analysed IdP, checked 2026-11-17)
 
-Latest release at the time of checking: 2026.8.5; 2026.11.0 is not yet tagged
-and contains none of the items below. This table is a snapshot. It does not
-prove anything about a release: the release check in the provider gate decides.
-Recheck it whenever a new Authentik release appears.
+At the time of checking, no released version of the analysed IdP contained any
+of the items below. This table is a snapshot. It does not prove anything about
+a release: the release check in the provider gate decides. Recheck it whenever
+a new IdP release appears.
 
-| Topic | Upstream item | Status |
-| --- | --- | --- |
-| RFC 8707 resource indicators, access-token `aud` = resource | [Issue #27645](https://github.com/goauthentik/authentik/issues/27645), [PR #27855](https://github.com/goauthentik/authentik/pull/27855) | Issue open, milestone 2027.2.0. PR open, under review: `resource` on authorize/token, per-provider allowed resources, `aud` from the grant, refresh can only narrow. |
-| MCP client support (CIMD, public MCP clients) | [Issue #27431](https://github.com/goauthentik/authentik/issues/27431), [Issue #27564](https://github.com/goauthentik/authentik/issues/27564) | Open, milestone 2027.2.0; #27645 is a sub-issue. |
-| Require PKCE / S256 only | [Issue #25520](https://github.com/goauthentik/authentik/issues/25520), [PR #27884](https://github.com/goauthentik/authentik/pull/27884) | Issue open, milestone 2027.2.0. PR is a draft: `pkce_mode` (optional / public clients / all) and `pkce_allow_plain`; discovery then advertises only S256. |
-| RFC 9068 access tokens (`typ: at+jwt`, resource `aud`, `client_id`) | [Issue #22070](https://github.com/goauthentik/authentik/issues/22070) | Open, milestone "Future release", no PR. Access tokens carry no `typ` header today. |
-| Scope-mapping `aud` overwrites ID-token `aud` | [Issue #25235](https://github.com/goauthentik/authentik/issues/25235) | Open, confirmed bug, milestone 2027.2.0. |
-| Audience for resource-server protection | [Issue #14545](https://github.com/goauthentik/authentik/issues/14545) | Closed 2026-11-04 in favour of #22070; maintainers point to token exchange in the meantime. |
+| Topic | Status |
+| --- | --- |
+| RFC 8707 resource indicators, access-token `aud` = resource | Requested upstream, not released. A proposed change adds `resource` on authorize/token, per-provider allowed resources, `aud` from the grant, and refresh that can only narrow. |
+| MCP client support (CIMD, public MCP clients) | Requested upstream, not released; resource indicators are a sub-item. |
+| Require PKCE / S256 only | Requested upstream, not released. A draft change adds a PKCE mode (optional / public clients / all) and an option to allow `plain`; discovery would then advertise only S256. |
+| RFC 9068 access tokens (`typ: at+jwt`, resource `aud`, `client_id`) | Requested upstream, no change in progress. Access tokens carry no `typ` header today. |
+| Scope-mapping `aud` overwrites ID-token `aud` | Confirmed upstream bug, not fixed. |
+| Audience for resource-server protection | Closed upstream in favour of the RFC 9068 request; maintainers point to token exchange in the meantime. |
 
-Consequences for this design: no released Authentik version meets the
-provider prerequisite yet, so implementation is blocked. Of today's Authentik
+Consequences for this design: no released IdP version meets the
+provider prerequisite yet, so implementation is blocked. Of the analysed IdP's
 tokens, only the access token carries a `scope` claim, which matches rule 2 of
 the ID-token criterion in section 4. Recheck this against the minimum release,
 because RFC 8707 support changes the access token's `aud`.
@@ -295,7 +291,7 @@ access-token lifetime plus the explicit clock tolerance (initially 60 seconds).
 If refresh does not enforce this, redesign the access check before rollout;
 do not assume UserInfo alone will fix every policy case.
 
-For a binding-denial experiment in Authentik, save the original bindings and
+For a binding-denial experiment in the IdP, save the original bindings and
 policy mode, use `policy_engine_mode=all`, and add a negated test-user binding
 alongside the group binding. In default `any` mode the group could still permit
 access. Prove a new authorization fails for the denied test user and succeeds
@@ -689,8 +685,5 @@ with disposable accounts before removing any MCP delete-tool restriction.
 - [NetBox permission naming](https://github.com/netbox-community/netbox/blob/v4.7.3/netbox/netbox/authentication/__init__.py)
 - [NetBox authentication settings](https://github.com/netbox-community/netbox/blob/v4.7.3/netbox/netbox/settings.py)
 - [DRF 401/403 behavior](https://www.django-rest-framework.org/api-guide/authentication/#unauthorized-and-forbidden-responses)
-- [Authentik scope mapping evaluation](https://github.com/goauthentik/authentik/blob/version/2026.8.5/authentik/providers/oauth2/views/userinfo.py)
-- [Authentik policy modes](https://github.com/goauthentik/authentik/blob/version/2026.8.5/authentik/policies/models.py)
-- [Authentik policy evaluation](https://github.com/goauthentik/authentik/blob/version/2026.8.5/authentik/policies/engine.py)
 - [MCP session lifetime](https://github.com/modelcontextprotocol/python-sdk/blob/v2.3.0/src/mcp/server/streamable_http_manager.py)
 - [MCP HTTP transport](https://github.com/modelcontextprotocol/python-sdk/blob/v2.3.0/src/mcp/server/streamable_http.py)

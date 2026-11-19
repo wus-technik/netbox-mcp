@@ -389,7 +389,7 @@ async def test_unknown_tool_is_invalid_params(client): ...       # McpError code
 - [ ] **Step 1: Write `test_e2e_full_lifecycle`**: metadata discovery over every path → DCR (loopback) → authorize → fake IdP → consent → code → token → MCP `initialize` + `tools/call netbox_get_objects` (NetBox sees the session bearer) → refresh → server restart (new app, same state file) → tool call works without login → group removal at the fake IdP → next refresh `invalid_grant` → NetBox token deleted by cleanup.
 - [ ] **Step 2: Write `test_spike_checklist`**: one assertion per spec Appendix A item (1–9) against the built app.
 - [ ] **Step 3: Run, fix gaps, run** `uv run pytest -v` → all PASS; `uv run ruff check src tests`; `uv run ty check` if configured.
-- [ ] **Step 4: Update docs; check** `tests/test_settings_documented.py` passes and `grep -ri "authentik" src` is empty.
+- [ ] **Step 4: Update docs; check** `tests/test_settings_documented.py` passes and no IdP product name appears in `src`.
 - [ ] **Step 5: Commit** `docs(oauth): document OAuth mode and add end-to-end test`
 
 ### Task 16: Review and acceptance

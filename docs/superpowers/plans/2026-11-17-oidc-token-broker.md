@@ -5,7 +5,7 @@
 Do not execute.
 
 Status: proposed work, not an implemented or verified feature. **Blocked** until
-Task 0 passes: every task below requires a released Authentik version that
+Task 0 passes: every task below requires a released IdP version that
 provides RFC 8707 resource indicators and required PKCE S256 natively (design,
 "Provider prerequisite").
 
@@ -40,34 +40,32 @@ actual client versions/hosted test dates privately.
 
 ## Phase 0: provider release prerequisite
 
-### Task 0: verify the Authentik release
+### Task 0: verify the IdP release
 
 No task of Phase A, B, C or D may start before this task is complete. This
 includes experiments, prototypes, implementation branches, image builds and
 provider configuration.
 
-- [ ] Identify the first **published** Authentik release (tagged, with release
+- [ ] Identify the first **published** IdP release (tagged, with release
   notes) that contains both:
-  - RFC 8707 resource indicators with `aud` set to the resource, from
-    issue #27645 / PR #27855;
-  - required PKCE with `plain` disallowed, from issue #25520 / PR #27884.
+  - RFC 8707 resource indicators with `aud` set to the resource;
+  - required PKCE with `plain` disallowed.
 
   A merged PR, `main`, a release candidate, a beta, a nightly image or a
   milestone does not count.
 - [ ] For each feature, verify presence in that release:
   - the release notes entry;
   - the provider settings in that version's documentation;
-  - the merged PR commit being contained in the release tag
-    (`gh api repos/goauthentik/authentik/compare/<merge-commit>...version/<release> --jq .status`
+  - the merged change's commit being contained in the release tag (for a
+    GitHub-hosted IdP, `gh api repos/<owner>/<repo>/compare/<merge-commit>...<release-tag> --jq .status`
     returns `ahead` or `identical`).
 
   Record links and results here, without deployment data.
-- [ ] If either feature is missing, stop. Recheck at the next Authentik
+- [ ] If either feature is missing, stop. Recheck at the next IdP
   release. Do not substitute token exchange, scope-mapping `aud`, expression
   policies, a proxy or a patched build.
 - [ ] Record the release as the **minimum provider version**. Update the design:
-  the reference version, the "Upstream status" table and the source links in
-  section 10.
+  the reference version and the "Upstream status" table.
 - [ ] Recheck the ID-token criterion and the claims the design expects (design
   section 4) against the minimum release's documentation before Phase A.
 

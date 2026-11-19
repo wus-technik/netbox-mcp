@@ -1,79 +1,79 @@
-# Review: Spec „OAuth authorization server with per-session NetBox tokens“
+# Review: Spec "OAuth authorization server with per-session NetBox tokens"
 
-- **Datum:** 2026-11-18
-- **Scope:** `docs/superpowers/specs/2026-11-18-oauth-authorization-server-design.md` (Branch
-  `oauth-plan-generic`, vor dem ersten Commit), abgeglichen mit `src/`, `tests/`, `fastmcp.json`, `.venv`
+- **Date:** 2026-11-18
+- **Scope:** `docs/superpowers/specs/2026-11-18-oauth-authorization-server-design.md` (branch
+  `oauth-plan-generic`, before the first commit), checked against `src/`, `tests/`, `fastmcp.json`, `.venv`
   (FastMCP 4.1.6, MCP SDK 2.3.0)
-- **Teil 1 – Codex-Review:** `codex-reviewer`-Agent, Codex CLI 0.170.0, Modell `gpt-6.1-terra`, read-only;
-  Einordnung und Zusatzbefunde (Z1–Z4) durch Claude
-- **Teil 2 – Abgleich mit der Referenzimplementierung:** Claude-Agent, read-only, gegen
-  `xwiki-mcp-server` `origin/hosted` @ 4a71e87 und den ungemergten Branch `fix/chatgpt-tools-protocol`
-- **Gesamturteil:** Änderungen nötig, Architektur bestätigt. Nichts kritisch.
-- **Status:** Alle Befunde am selben Tag in die Spec eingearbeitet, einschließlich der Maintainer-Entscheidung
-  zur Häufigkeit der IdP-Prüfung (Spec §6.4).
+- **Part 1 - Codex review:** `codex-reviewer` agent, Codex CLI 0.170.0, model `gpt-6.1-terra`, read-only;
+  triage and additional findings (Z1-Z4) by Claude
+- **Part 2 - comparison with the reference implementation:** Claude agent, read-only, against the internal
+  reference implementation (its hosted branch and an unmerged fix branch for ChatGPT tool-protocol handling)
+- **Overall verdict:** Changes needed, architecture confirmed. Nothing critical.
+- **Status:** All findings were incorporated into the spec on the same day, including the maintainer decision
+  on how often the IdP is checked (spec §6.4).
 
-## Teil 1: Codex-Review
+## Part 1: Codex review
 
-| # | Schwere (eingeordnet) | Ort | Befund | Urteil | Maßnahme |
+| # | Severity (triaged) | Location | Finding | Verdict | Action |
 |---|---|---|---|---|---|
-| 1 | hoch | §5.3, §6.4 | Userinfo-`sub` wird nicht gegen ID-Token-`sub` bzw. gespeicherte Verknüpfung geprüft | gültig (OIDC Core 5.3.2) | §5.3 Schritt 3, §6.4 |
-| 2 | mittel | §6.1 | Eindeutiger Benutzername beweist keinen Besitz; lokales NetBox-Konto mit gleichem Namen würde verknüpft | wahrscheinlich gültig | §6.1: lokale Konten müssen auf die Sperrliste (Pflicht-Deployment-Schritt), Superuser abgelehnt |
-| 3 | mittel | §5.4, §8 | (a) Replay-Fenster gibt Nachfolger an jeden Inhaber des alten Tokens; (b) nur ein alter Hash gespeichert → ältere Wiederverwendung beendet die Sitzung nicht | (b) gültig, (a) gültig, eng | §5.4: alle verbrauchten Hashes bis Sitzungsende; (a) als Restrisiko dokumentiert |
-| 4 | mittel | §5.3, §6.4 | Fenster zwischen IdP-Antwort und Schreiben; Abgleich und Login können sich überholen | wahrscheinlich gültig | §6.4: IdP-Refresh je Sitzung serialisiert, unbekannter Ausgang schlägt geschlossen fehl |
-| 5 | hoch | §6.2, §6.3 | Erneuerung ohne Marker, altes Token nicht atomar in die Aufräumliste; Erneuerung vs. Sitzungsende | gültig | §6.2: Marker auch bei Erneuerung, ein Schreibvorgang für Tausch + Aufräumeintrag, Sitzungs-Lock |
-| 6 | hoch | §8 | „Fehlende Datei → leerer Zustand“ widerspricht dem Anti-Ziel „kein stiller Neuanfang“ | gültig | §8: fehlende Datei → Start verweigert, `netbox-mcp oauth init` |
-| 7 | hoch | §8 | Restore bringt widerrufene Sitzungen zurück | gültig | §8: `oauth restore-reset` beendet alle wiederhergestellten Sitzungen |
-| 8 | niedrig | §5.2, §5.3 | DCR-Client-Namen unverifiziert, gemerkte Zustimmung | überzogen (Redirect-Allowlist begrenzt Missbrauch) | §5.2/§5.3: Name als „unverifiziert“ angezeigt |
-| 9 | mittel | §5.4, §5.5 | Refresh und Revoke prüfen `client_id` nicht | gültig | §5.4, §5.5 |
-| 10 | mittel | §2, §6.3, §6.4 | „höchstens ein Tag“ vs. „nicht erreichbar → behalten“; Ergebnis des erkennenden Tool-Calls offen | gültig | §6.4: IdP-Prüfung bei jedem Refresh begrenzt den Zugriff auf ≈ 1 h; §6.3 Tool-Fehler, dann 401 |
-| 11 | mittel | §5.1, §9 | `MCP_PUBLIC_URL` und IdP-URLs nicht validiert | gültig | §5.1 Startprüfung |
-| 12 | niedrig | §7.2, §7.5 | „kein Schlüssel `content`“ mehrdeutig; „herunterverhandeln“ nur bei `initialize` | wahrscheinlich gültig | §7.2, §7.6 umformuliert |
-| 13 | hoch | §4, `server.py`, `fastmcp.json` | Äußere App braucht `lifespan=mcp_app.lifespan`; Ablehnung von `fastmcp run` in `main()` greift nie | gültig (verifiziert, `fastmcp/server/http.py:104-106`) | §4: Lifespan-Komposition, Marker-Prüfung im FastMCP-Lifespan, Tests für beide Startwege |
-| 14 | mittel | `auth.py:319-330` | Rate-Limit nach DCR-`client_id` statt nach Nutzer | gültig (verifiziert) | §4: Schlüssel `claims["sub"]` |
-| 15 | niedrig | `tests/test_settings_documented.py:11-14` | Doku-Test scannt neue Module nicht | gültig (verifiziert) | §9 |
-| Z1 | mittel | §3, §1 | Personenname und Ich-Form in einem öffentlichen Repo | gültig | neutral formuliert („maintainer decision“) |
-| Z2 | niedrig | §3, §10 | Spec verweist auf nicht committete Spike-Dateien | gültig | Anhang A, Mock-IdP-Anforderungen in §10 |
-| Z3 | Info | §4 | `JWTIssuer` deckt die Claims ab (`jwt_issuer.py:105-160`) | – | §4 festgelegt |
-| Z4 | Info | §7.3 | FastMCP hat eigenen Host/Origin-Schutz (`mixins/transport.py:367-405`) | – | §4: abgestimmt konfigurieren, äußere Schicht maßgeblich |
+| 1 | high | §5.3, §6.4 | Userinfo `sub` is not checked against the ID-token `sub` or the stored link | valid (OIDC Core 5.3.2) | §5.3 step 3, §6.4 |
+| 2 | medium | §6.1 | A unique username does not prove ownership; a local NetBox account with the same name would be linked | probably valid | §6.1: local accounts must go on the deny list (mandatory deployment step), superusers rejected |
+| 3 | medium | §5.4, §8 | (a) The replay window hands the successor to any holder of the old token; (b) only one old hash is stored, so reusing an older token does not end the session | (b) valid, (a) valid, narrow | §5.4: all consumed hashes kept until the session ends; (a) documented as residual risk |
+| 4 | medium | §5.3, §6.4 | Window between the IdP response and the write; reconciliation and login can overtake each other | probably valid | §6.4: IdP refresh serialized per session, unknown outcome fails closed |
+| 5 | high | §6.2, §6.3 | Renewal without a marker, old token not atomically added to the cleanup list; renewal vs. session end | valid | §6.2: marker also on renewal, one write for swap + cleanup entry, session lock |
+| 6 | high | §8 | "Missing file -> empty state" contradicts the anti-goal "no silent fresh start" | valid | §8: missing file -> start refused, `netbox-mcp oauth init` |
+| 7 | high | §8 | A restore brings revoked sessions back | valid | §8: `oauth restore-reset` ends all restored sessions |
+| 8 | low | §5.2, §5.3 | DCR client names are unverified, consent is remembered | overstated (the redirect allowlist limits abuse) | §5.2/§5.3: name shown as "unverified" |
+| 9 | medium | §5.4, §5.5 | Refresh and revoke do not check `client_id` | valid | §5.4, §5.5 |
+| 10 | medium | §2, §6.3, §6.4 | "at most one day" vs. "unreachable -> keep"; outcome of the detecting tool call is open | valid | §6.4: IdP check on every refresh limits access to about 1 h; §6.3 tool error, then 401 |
+| 11 | medium | §5.1, §9 | `MCP_PUBLIC_URL` and IdP URLs are not validated | valid | §5.1 startup check |
+| 12 | low | §7.2, §7.5 | "no `content` key" is ambiguous; "negotiating down" only applies to `initialize` | probably valid | §7.2, §7.6 reworded |
+| 13 | high | §4, `server.py`, `fastmcp.json` | The outer app needs `lifespan=mcp_app.lifespan`; the rejection of `fastmcp run` in `main()` never fires | valid (verified, `fastmcp/server/http.py:104-106`) | §4: lifespan composition, marker check in the FastMCP lifespan, tests for both start paths |
+| 14 | medium | `auth.py:319-330` | Rate limit keyed by DCR `client_id` instead of by user | valid (verified) | §4: key `claims["sub"]` |
+| 15 | low | `tests/test_settings_documented.py:11-14` | The documentation test does not scan new modules | valid (verified) | §9 |
+| Z1 | medium | §3, §1 | A personal name and first-person voice in a public repo | valid | worded neutrally ("maintainer decision") |
+| Z2 | low | §3, §10 | The spec refers to uncommitted spike files | valid | Appendix A, mock-IdP requirements in §10 |
+| Z3 | info | §4 | `JWTIssuer` covers the claims (`jwt_issuer.py:105-160`) | - | fixed in §4 |
+| Z4 | info | §7.3 | FastMCP has its own host/origin protection (`mixins/transport.py:367-405`) | - | §4: configure consistently, the outer layer is authoritative |
 
-## Teil 2: Abgleich mit der Referenzimplementierung
+## Part 2: Comparison with the reference implementation
 
-Klassen: (a) bewusst/begründet, (b) Lücke, (c) Widerspruch, der einen Client brechen kann.
+Classes: (a) deliberate/justified, (b) gap, (c) contradiction that can break a client.
 
-| # | Bereich | Referenz | Klasse | Maßnahme in der Spec |
+| # | Area | Reference | Class | Action in the spec |
 |---|---|---|---|---|
-| 1 | Scopes | ein Ressourcen-Scope, kein `openid` | (c) | §5.1: Scope `netbox`; die frühere Angabe „wie in der Referenz“ beruhte auf einem veralteten lokalen Branch |
-| 2 | `resource` | optional, ein abschließender `/` toleriert | (c) | §5.3, §5.4 |
-| 3 | Root-Aliase `/register`, `/authorize`, `/token`, `/revoke` | echte Handler (Claude Code) | (b) | §5.1 |
-| 4 | Erneuerung vs. laufender Tool-Call | `tokenVersion`, einmal mit aktuellem Token wiederholen | (b)/(c) | §6.2, §6.3 |
-| 5 | Verwaiste Sitzungen (Code nie eingelöst) | Ende nach 10 min | (b) | §6.3 |
-| 6 | Replay-Fenster | ein Slot, strikt < 30 s, Body nicht verglichen, Lock | (b) | §5.4 exakt beschrieben (strenger bei alten Hashes) |
-| 7 | Transport | zustandslos, GET/DELETE 405, Notifications 202 | (b) | §4, §7.5 |
-| 8 | `/mcp/` | wird bedient | (c) | §7.4 |
-| 9 | DCR-Auth-Methode | nie ablehnen, immer `none` | (b) | §5.2 |
-| 10 | Redirect-Validierung im Detail | Grenzen, Zeichen, Muster | (b) | §5.2 |
-| 11 | Query-Strings im Log | nur Pfad | (b) | §4, §9: Access-Log aus |
-| 12 | pending-create | atomares Entfernen, 10-min-Schutz, auch bei Erneuerung | (b) | §6.2 |
-| 13 | IdP bei jedem Refresh | ja, Sperre ≈ 1 h | (a) | übernommen (Maintainer-Entscheidung), §5.4, §6.4 |
-| 14 | Code-Wiederverwendung | `invalid_grant`, Sitzung bleibt; TTL 5 min | (a)/(c) | §5.4, §5.3: wie Referenz |
-| 15 | Fehlerrouting | Validierungsfehler als HTML-Seite; IdP-`error` → `access_denied` | (a) | §5.3 |
-| 16 | 401-Header | `realm`, `/mcp/.well-known/...`, `error` nur mit Token | (b) | §7.1 |
-| 17 | Protokollversionen | echtes Datum, > neueste, ≤ 2 Jahre; `initialize` → neueste | (b) | §7.2 |
-| 18 | Tool-Ergebnisse | `structuredContent` als Objekt, Listen gewrappt; nicht live verifiziert | (b) | §7.6 |
-| 19 | Flow-Cookie und Header | Pfad, 10 min, Lax, no-store, no-referrer, Anti-Framing | (b) | §5.3 |
-| 20 | Revoke-Details | 200 für unbekannte Tokens, abgelaufene widerrufbar | (b) | §5.5 |
-| 21 | IdP-/NetBox-Klassifikation | Userinfo 401, fehlende Gruppen, kein Redirect-Folgen, HTML = nicht erreichbar | (b) | §6.4 |
-| 22 | Access-Token-Prüfung | `client_id` = Sitzungs-Client | (b) | §5.4 |
-| 23 | Root-`openid-configuration` | nicht ausgeliefert | (a) | §5.1 entfernt |
-| 24 | Speicherformat | Feldweise versiegelt, leere Datei sofort geschrieben | (a) | §8 Abweichung markiert; Start ohne Datei verweigert |
-| 25–28 | Aufräumtakt, Registrierungsablauf, CORS, PKCE zum IdP | – | (a)/(b) | §6.3, §5.2 (30 Tage), §2 (kein CORS), §5.3 |
+| 1 | Scopes | one resource scope, no `openid` | (c) | §5.1: scope `netbox`; the earlier statement "as in the reference" was based on an outdated local branch |
+| 2 | `resource` | optional, one trailing `/` tolerated | (c) | §5.3, §5.4 |
+| 3 | Root aliases `/register`, `/authorize`, `/token`, `/revoke` | real handlers (Claude Code) | (b) | §5.1 |
+| 4 | Renewal vs. running tool call | `tokenVersion`, retry once with the current token | (b)/(c) | §6.2, §6.3 |
+| 5 | Orphaned sessions (code never redeemed) | end after 10 min | (b) | §6.3 |
+| 6 | Replay window | one slot, strictly < 30 s, body not compared, lock | (b) | §5.4 described exactly (stricter for old hashes) |
+| 7 | Transport | stateless, GET/DELETE 405, notifications 202 | (b) | §4, §7.5 |
+| 8 | `/mcp/` | is served | (c) | §7.4 |
+| 9 | DCR auth method | never reject, always `none` | (b) | §5.2 |
+| 10 | Redirect validation in detail | limits, characters, patterns | (b) | §5.2 |
+| 11 | Query strings in the log | path only | (b) | §4, §9: access log off |
+| 12 | pending-create | atomic removal, 10-min protection, also on renewal | (b) | §6.2 |
+| 13 | IdP on every refresh | yes, block about 1 h | (a) | adopted (maintainer decision), §5.4, §6.4 |
+| 14 | Code reuse | `invalid_grant`, session stays; TTL 5 min | (a)/(c) | §5.4, §5.3: as in the reference |
+| 15 | Error routing | validation errors as HTML page; IdP `error` -> `access_denied` | (a) | §5.3 |
+| 16 | 401 header | `realm`, `/mcp/.well-known/...`, `error` only with a token | (b) | §7.1 |
+| 17 | Protocol versions | real date, > newest, <= 2 years; `initialize` -> newest | (b) | §7.2 |
+| 18 | Tool results | `structuredContent` as object, lists wrapped; not verified live | (b) | §7.6 |
+| 19 | Flow cookie and headers | path, 10 min, Lax, no-store, no-referrer, anti-framing | (b) | §5.3 |
+| 20 | Revoke details | 200 for unknown tokens, expired ones revocable | (b) | §5.5 |
+| 21 | IdP/NetBox classification | userinfo 401, missing groups, no redirect following, HTML = unreachable | (b) | §6.4 |
+| 22 | Access-token check | `client_id` = session client | (b) | §5.4 |
+| 23 | Root `openid-configuration` | not served | (a) | removed in §5.1 |
+| 24 | Storage format | sealed field by field, empty file written immediately | (a) | §8 deviation marked; start without a file refused |
+| 25-28 | Cleanup cadence, registration flow, CORS, PKCE to the IdP | - | (a)/(b) | §6.3, §5.2 (30 days), §2 (no CORS), §5.3 |
 
-Fixes der Referenz nach Client-Fehlern, die die erste Fassung nicht abdeckte und die jetzt drinstehen: Root-Aliase
-(Claude Code), Notification 202 (Codex CLI), toleranter `resource` mit Slash, Objekt-Wrapping für
-`structuredContent`, exakte Versionsregel.
+Fixes in the reference after client failures that the first draft did not cover and that are now included: root
+aliases (Claude Code), notification 202 (Codex CLI), tolerant `resource` with slash, object wrapping for
+`structuredContent`, exact version rule.
 
-## Entscheidung
+## Decision
 
-Spec §6.4: IdP-Prüfung bei jedem Client-Refresh (wie Referenz, Sperre ≈ 1 h, IdP-Ausfall blockiert den
-Refresh) statt täglich. Maintainer-Entscheidung 2026-11-18. Die 48-h-Veraltungsregel aus Codex-Befund 10
-entfällt damit; der tägliche Lauf prüft nur noch die NetBox-Seite.
+Spec §6.4: IdP check on every client refresh (as in the reference, block about 1 h, an IdP outage blocks the
+refresh) instead of daily. Maintainer decision 2026-11-18. The 48-h staleness rule from Codex finding 10 is
+therefore dropped; the daily run now only checks the NetBox side.

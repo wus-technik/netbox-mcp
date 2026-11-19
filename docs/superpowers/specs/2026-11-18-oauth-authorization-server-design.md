@@ -26,14 +26,10 @@ removes that dependency: **netbox-mcp is itself the OAuth authorization server
 ordinary OIDC relying-party login. The same pattern runs in production for a
 sibling MCP server and works with all five clients listed above.
 
-**Reference implementation:** `wus-technik/xwiki-mcp-server`, branch
-`origin/hosted` (Node.js; the unmerged branch `fix/chatgpt-tools-protocol`
-for tool results and version tolerance): `src/oauth.js`, `src/sessions.js`,
-`src/store.js`, `src/crypto-box.js`, `src/authentik.js`, `src/redirects.js`,
-`src/metadata.js`, `src/auth-middleware.js`, `src/app.js`, its plan
-`docs/superpowers/plans/2026-11-17-global-oauth.md` and reviews under
-`docs/superpowers/reviews/2026-11-18-*`. Read it for behaviour, do not port
-line by line. **This spec wins** where the two differ; where this spec is
+**Reference implementation:** an internal MCP server that already runs this
+design (Node.js): its OAuth, session, store, crypto-box, IdP client, redirect,
+metadata, auth-middleware and app modules, its plan and its reviews. Read it
+for behaviour, do not port line by line. **This spec wins** where the two differ; where this spec is
 silent, follow the reference. Deliberate deviations are marked *(deviation)*.
 
 Pilot lessons referred to below: 1 = 401 before the version check (§7);
@@ -450,7 +446,7 @@ Rules:
    `WWW-Authenticate: Bearer realm="<MCP_PUBLIC_URL>", resource_metadata="<MCP_PUBLIC_URL>/.well-known/oauth-protected-resource", scope="netbox"`,
    values quoted and escaped. With a presented but invalid token add
    `error="invalid_token"`; without credentials no error code (RFC 6750).
-2. Protocol versions (rule from `fix/chatgpt-tools-protocol`): supported are
+2. Protocol versions (rule from the reference's ChatGPT tool-protocol fix): supported are
    the versions of the locked SDK. A header with a real calendar date newer than
    the newest supported and at most two years ahead is tolerated (claude.ai and
    ChatGPT send `2026-07-28`); anything else is 400. `initialize` is never
