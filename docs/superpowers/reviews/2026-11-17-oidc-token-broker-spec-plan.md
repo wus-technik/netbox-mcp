@@ -1,78 +1,76 @@
-# Review: OIDC-Token-Broker – Spec und Plan
+# Review: OIDC token broker - spec and plan
 
-- **Datum:** 2026-11-17
+- **Date:** 2026-11-17
 - **Scope:** `docs/superpowers/specs/2026-11-17-oidc-token-broker-design.md`,
-  `docs/superpowers/plans/2026-11-17-oidc-token-broker.md` (Branch `oauth-plan-generic`),
-  abgeglichen mit `src/`, `tests/`, `pyproject.toml`/`uv.lock`, Dockerfile, README
-- **Modell/Befehl:** Codex CLI 0.169.0, `gpt-6.1-sol`,
-  `codex exec --sandbox read-only --model gpt-6.1-sol -`; Einordnung und Zusatzbefunde durch Claude
-- **Gesamturteil:** Umsetzbar nach Korrekturen. Die Architektur steht, es fehlen Garantien und Plan-Tasks.
+  `docs/superpowers/plans/2026-11-17-oidc-token-broker.md` (branch `oauth-plan-generic`),
+  checked against `src/`, `tests/`, `pyproject.toml`/`uv.lock`, Dockerfile, README
+- **Model/command:** Codex CLI 0.169.0, `gpt-6.1-sol`,
+  `codex exec --sandbox read-only --model gpt-6.1-sol -`; triage and additional findings by Claude
+- **Overall verdict:** Implementable after corrections. The architecture stands, but guarantees and plan tasks are missing.
 
-Status: alle Befunde am selben Tag in Spec und Plan eingearbeitet (siehe „Maßnahmen“).
+Status: all findings were incorporated into the spec and plan on the same day (see "Actions").
 
-## Befunde
+## Findings
 
-| # | Schwere | Ort | Befund | Fix | Urteil |
+| # | Severity | Location | Finding | Fix | Verdict |
 |---|---|---|---|---|---|
-| 1 | hoch | Spec §3 (~Z. 114); Plan Task 8 | Beim ersten Login wird `preferred_username` auf einen NetBox-User abgebildet. Das beweist nur Eindeutigkeit, nicht Besitz. Der Claim ist nicht stabil, und es gibt keine Unique-Regel auf `netbox_user_id`, sodass zwei `(iss, sub)` auf denselben User zeigen können. | Admin-kontrollierter Username-Namensraum oder vorab provisioniertes Mapping. UNIQUE auf `netbox_user_id` unter aktiven Identitäten. Tests für Kollision und Rename. | gültig |
-| 2 | hoch | Spec §3 Z. 93–99; Plan Tasks 1, 12 | Der IdP setzt PKCE S256 per Konfiguration nicht durch: Es bietet `plain` und `S256` an und akzeptiert Requests ohne Challenge. Die Vorgabe `["S256"]` für die Discovery ist so nicht erfüllbar. | Expression Policy für eine S256-Pflicht-Challenge. Anforderung auf „enthält `S256`“ ändern und auf die Negativ-Probes stützen. | wahrscheinlich gültig (Quelle nicht selbst geprüft) |
-| 3 | hoch | Plan Task 9; `src/netbox_mcp/server.py:105-110` | `FastMCP` und der Auth-Provider entstehen beim Import, und `fastmcp run` ruft `main()` nicht auf. Kein Task regelt, wo Store-Lock, Recovery, Hintergrund-Loops und Shutdown laufen. | Neuer Task mit `FastMCP(lifespan=...)`. Test, dass der Import keinen Lock nimmt, und Test für Shutdown bei gehaltenen Leases. | gültig (verifiziert) |
-| 4 | mittel | Plan Task 8; `src/netbox_mcp/retry.py:94-96` | Die Retry-Transport-Schicht wiederholt nicht-idempotente POSTs bei 429. Das widerspricht „ein POST pro Journal-Eintrag“. Branching würde zudem einen Branch-Lookup und den Header mit dem Broker-Token senden. | Broker-Client mit `retry=False` und `use_branch=False`. Tests: genau ein POST bei 429, kein Branch-Header. | gültig (verifiziert) |
-| 5 | mittel | Spec §4 (~Z. 212); Plan Task 6 | Die JWKS-Discovery über den Issuer hat keinen Task. Der IdP nutzt einen Path-Issuer mit Slash und nur die angehängte Form `/.well-known/openid-configuration`. Die AS-Metadata-Discovery der Clients (Reihenfolge nach MCP 2025-11-25) wird nicht geprüft. | Discovery-Schritt mit exakter URL-Konstruktion und exaktem Issuer-Vergleich. AS-Discovery je Client in die Phase-A-Probes aufnehmen. | gültig |
-| 6 | mittel | Plan Tasks 6, 9; `src/netbox_mcp/auth.py:51-69, 143-158` | Ein einziges `JwtRejected` erlaubt kein `403 insufficient_scope`. Der 503-Handler hängt an `NetBoxTokenVerifier.get_middleware()` und geht beim Wrapping in einen äußeren Provider verloren. | Getypte Fehler (Scope → 403, Broker-Ablehnung → 403, Ausfall → 503). `on_error` am äußersten Provider. Regressionstest für 503. | gültig (FastMCP-Interna nicht lokal geprüft) |
-| 7 | mittel | Spec §4, §8; Plan Tasks 6, 9 | Der Aufbau von `AccessToken` ist unklar: Wo liegt `netbox_mcp_auth_mode` (vermutlich `claims`)? `Identity` verliert `exp`, sodass `expires_at` fehlt. Die Leeway-Politik zwischen SDK und Spec ist uneinheitlich. | Marker in `claims`, vom Server gesetzt. `exp` → `expires_at`. Eine Leeway-Regel, getestet mit injizierter Uhr. | wahrscheinlich gültig |
-| 8 | mittel | Plan Task 5; `tests/test_settings_documented.py:11-14` | Der Doku-Test scannt nur `netbox_client.py` und `utils.py`. Neue Variablen in `oidc/config.py` würden nicht geprüft. | Bestehendes Muster nutzen oder `SOURCES` erweitern. `.env.example`, README und `server.json`/`REGISTRY_EXCLUDED` explizit regeln. | gültig (verifiziert) |
-| 9 | mittel (Codex: hoch) | Spec §1 Z. ~27–29, §4 | NetBox-Token-Passthrough auf demselben Endpoint verletzt die MCP-Regel „no token passthrough“. Das Verhalten besteht schon und ist beabsichtigt, ist also kein neues Risiko. | Als Kompatibilitätsausnahme dokumentieren, optional abschaltbar machen, wenn OIDC aktiv ist. `AccessToken.resource` nicht als Resource Binding ausgeben. | gültig |
-| 10 | mittel | Spec §4 | „ID-Token muss scheitern, auch bei passender Audience“ – ohne Unterscheidungskriterium. Beim analysierten IdP sind sich die Claims sehr ähnlich. | Kriterium festlegen (z. B. `scope`-Claim Pflicht oder `typ=at+jwt`) und in Phase A mit echten Tokens bestätigen. | gültig (Claude) |
-| 11 | niedrig | Plan Z. 173 | Ein IdP-spezifischer Verifier-Klassenname widerspricht Spec §9 (keine anbieterspezifischen Namen im Paketcode). | In `OidcJwtVerifier` umbenennen. | gültig (verifiziert) |
-| 12 | niedrig | Spec §4, §9 | `NETBOX_TOKEN_PASSTHROUGH=true` fehlt in der Pflichtliste. SSE-Status unklar. `TOKEN_STORE_PATH` ist optional ohne Default, obwohl der Store Pflicht ist. Dockerfile ohne Volume, läuft als UID 10001. | Store-Pfad verpflichtend oder mit Default. Transportregel festlegen. Tests in Task 5. | gültig (Claude) |
-| 13 | niedrig | Plan (Deps) | PyJWT kommt neben joserfc/authlib (FastMCP) hinzu – zwei JOSE-Bibliotheken. | Wahl begründen oder vereinheitlichen. | Ermessensfrage |
-| 14 | niedrig | Spec §3 | `codex mcp add --oauth-client-secret` landet in der Shell-History. | Weg ohne Kommandozeile vorschreiben. | gültig (Claude) |
-| 15 | niedrig | Plan (Tests) | `tests/oidc/test_config.py` kollidiert mit `tests/test_config.py`. | `tests/oidc/__init__.py` anlegen. | unsicher |
-| 16 | Info | Plan Task 4 (Gate) | Der IdP setzt `aud = client_id` und unterstützt RFC 8707 vermutlich nicht. Das Gate dürfte Phase A stoppen. | Fallback vorab benennen (anderer IdP, Token Exchange). | Hinweis |
-| 17 | Info | Spec §6–§8 | Die Generation/Lease/Journal-Mechanik ist umfangreich. | Prüfen, ob ein einfacherer Lebenszyklus die Ziele erfüllt. | Hinweis |
+| 1 | high | Spec §3 (~l. 114); Plan Task 8 | On first login, `preferred_username` is mapped to a NetBox user. That proves uniqueness only, not ownership. The claim is not stable, and there is no unique rule on `netbox_user_id`, so two `(iss, sub)` pairs can point to the same user. | Admin-controlled username namespace or a pre-provisioned mapping. UNIQUE on `netbox_user_id` among active identities. Tests for collision and rename. | valid |
+| 2 | high | Spec §3 l. 93-99; Plan Tasks 1, 12 | The IdP does not enforce PKCE S256 by configuration: it offers `plain` and `S256` and accepts requests without a challenge. The discovery requirement `["S256"]` cannot be met as written. | Expression policy for a mandatory S256 challenge. Change the requirement to "contains `S256`" and base it on the negative probes. | probably valid (source not checked by me) |
+| 3 | high | Plan Task 9; `src/netbox_mcp/server.py:105-110` | `FastMCP` and the auth provider are created at import, and `fastmcp run` does not call `main()`. No task defines where the store lock, recovery, background loops and shutdown run. | New task with `FastMCP(lifespan=...)`. Test that the import takes no lock, and a test for shutdown while leases are held. | valid (verified) |
+| 4 | medium | Plan Task 8; `src/netbox_mcp/retry.py:94-96` | The retry transport layer repeats non-idempotent POSTs on 429. This contradicts "one POST per journal entry". Branching would also send a branch lookup and the header with the broker token. | Broker client with `retry=False` and `use_branch=False`. Tests: exactly one POST on 429, no branch header. | valid (verified) |
+| 5 | medium | Spec §4 (~l. 212); Plan Task 6 | JWKS discovery via the issuer has no task. The IdP uses a path issuer with a slash and only the appended form `/.well-known/openid-configuration`. The clients' AS metadata discovery (order per MCP 2025-11-25) is not checked. | Discovery step with exact URL construction and exact issuer comparison. Include AS discovery per client in the phase A probes. | valid |
+| 6 | medium | Plan Tasks 6, 9; `src/netbox_mcp/auth.py:51-69, 143-158` | A single `JwtRejected` does not allow `403 insufficient_scope`. The 503 handler hangs off `NetBoxTokenVerifier.get_middleware()` and is lost when wrapped in an outer provider. | Typed errors (scope -> 403, broker rejection -> 403, outage -> 503). `on_error` on the outermost provider. Regression test for 503. | valid (FastMCP internals not checked locally) |
+| 7 | medium | Spec §4, §8; Plan Tasks 6, 9 | The structure of `AccessToken` is unclear: where does `netbox_mcp_auth_mode` live (presumably `claims`)? `Identity` loses `exp`, so `expires_at` is missing. The leeway policy is inconsistent between SDK and spec. | Marker in `claims`, set by the server. `exp` -> `expires_at`. One leeway rule, tested with an injected clock. | probably valid |
+| 8 | medium | Plan Task 5; `tests/test_settings_documented.py:11-14` | The documentation test scans only `netbox_client.py` and `utils.py`. New variables in `oidc/config.py` would not be checked. | Use the existing pattern or extend `SOURCES`. Settle `.env.example`, README and `server.json`/`REGISTRY_EXCLUDED` explicitly. | valid (verified) |
+| 9 | medium (Codex: high) | Spec §1 l. ~27-29, §4 | NetBox token passthrough on the same endpoint violates the MCP rule "no token passthrough". The behavior already exists and is intentional, so it is not a new risk. | Document as a compatibility exception, optionally make it switchable off when OIDC is active. Do not emit `AccessToken.resource` as resource binding. | valid |
+| 10 | medium | Spec §4 | "ID token must fail, even with a matching audience" - without a distinguishing criterion. For the analyzed IdP the claims are very similar. | Define a criterion (e.g. mandatory `scope` claim or `typ=at+jwt`) and confirm it in phase A with real tokens. | valid (Claude) |
+| 11 | low | Plan l. 173 | An IdP-specific verifier class name contradicts spec §9 (no vendor-specific names in package code). | Rename to `OidcJwtVerifier`. | valid (verified) |
+| 12 | low | Spec §4, §9 | `NETBOX_TOKEN_PASSTHROUGH=true` is missing from the mandatory list. SSE status is unclear. `TOKEN_STORE_PATH` is optional without a default although the store is mandatory. Dockerfile has no volume and runs as UID 10001. | Make the store path mandatory or give it a default. Define a transport rule. Tests in Task 5. | valid (Claude) |
+| 13 | low | Plan (deps) | PyJWT is added next to joserfc/authlib (FastMCP) - two JOSE libraries. | Justify the choice or unify. | judgment call |
+| 14 | low | Spec §3 | `codex mcp add --oauth-client-secret` ends up in the shell history. | Prescribe a way that avoids the command line. | valid (Claude) |
+| 15 | low | Plan (tests) | `tests/oidc/test_config.py` collides with `tests/test_config.py`. | Create `tests/oidc/__init__.py`. | uncertain |
+| 16 | info | Plan Task 4 (gate) | The IdP sets `aud = client_id` and presumably does not support RFC 8707. The gate would likely stop phase A. | Name the fallback up front (different IdP, token exchange). | note |
+| 17 | info | Spec §6-§8 | The generation/lease/journal mechanics are extensive. | Check whether a simpler lifecycle meets the goals. | note |
 
-## Kompatibilität (Bestätigtes)
+## Compatibility (confirmed)
 
-- Vorregistrierte Credentials sind der erste Registrierungsweg nach MCP 2025-11-25. Der Verzicht auf DCR und CIMD ist damit legitim.
-- PRM-Pfade, `resource`-Wert und Scope-Challenge sind konsistent mit RFC 9728.
-- Codex CLI 0.169.0 kennt `--oauth-client-id`/`--oauth-client-secret`.
-- Die Callback-URLs von claude.ai und ChatGPT wurden nicht erneut verifiziert.
+- Pre-registered credentials are the first registration path under MCP 2025-11-25. Dropping DCR and CIMD is therefore legitimate.
+- PRM paths, `resource` value and scope challenge are consistent with RFC 9728.
+- Codex CLI 0.169.0 knows `--oauth-client-id`/`--oauth-client-secret`.
+- The callback URLs of claude.ai and ChatGPT were not verified again.
 
-## Maßnahmen
+## Actions
 
-| # | Umsetzung |
+| # | Implementation |
 |---|---|
-| 1 | Spec §3: admin-kontrollierter Username-Namensraum als Deployment-Voraussetzung, eine aktive Identität pro NetBox-User, keine automatische Neuverknüpfung. Spec §6: partieller Unique-Index. Plan Tasks 1, 7, 8, 12: Prüfung und Regressionstests. |
-| 2 | Spec §3: Discovery „enthält S256“. IdP-Expression-Policy, deren Machbarkeit Phase A belegen muss. Plan Tasks 1, 12. |
-| 3 | Spec §8: Abschnitt „Server lifecycle“. Plan: neuer Task 9a (Lifespan, Loops, Shutdown, Import ohne Seiteneffekte). |
-| 4 | Spec §5: Broker-Client mit `retry=False`/`use_branch=False`. Plan Task 8: Tests für 429 und Branching. |
-| 5 | Spec §3/§4: AS-Discovery-Formen und JWKS-Discovery mit exaktem Issuer-Vergleich. Plan Tasks 2, 6. |
-| 6 | Spec §4: Tabelle der getypten Ablehnungen, Handler am äußersten Provider. Plan Tasks 6, 9. |
-| 7 | Spec §4: `AccessToken` mit `expires_at` und `claims`-Marker, 60 s Leeway einheitlich. Plan Tasks 6, 9. |
-| 8 | Spec §9 und Plan Task 5: Settings in `netbox_client.py`/`models.py`, `.env.example`, README, `REGISTRY_EXCLUDED`. |
-| 9 | Spec §1: Compliance-Ausnahme dokumentiert, `OIDC_ACCEPT_NETBOX_TOKENS` (Default `true`). |
-| 10 | Spec §4: Unterscheidungsregel (`typ`, `scope`, `nonce`/`at_hash`). Plan Task 2: mit echten Tokens bestätigen. |
+| 1 | Spec §3: admin-controlled username namespace as a deployment prerequisite, one active identity per NetBox user, no automatic relinking. Spec §6: partial unique index. Plan Tasks 1, 7, 8, 12: check and regression tests. |
+| 2 | Spec §3: discovery "contains S256". IdP expression policy, whose feasibility phase A must prove. Plan Tasks 1, 12. |
+| 3 | Spec §8: section "Server lifecycle". Plan: new Task 9a (lifespan, loops, shutdown, import without side effects). |
+| 4 | Spec §5: broker client with `retry=False`/`use_branch=False`. Plan Task 8: tests for 429 and branching. |
+| 5 | Spec §3/§4: AS discovery forms and JWKS discovery with exact issuer comparison. Plan Tasks 2, 6. |
+| 6 | Spec §4: table of typed rejections, handler on the outermost provider. Plan Tasks 6, 9. |
+| 7 | Spec §4: `AccessToken` with `expires_at` and `claims` marker, uniform 60 s leeway. Plan Tasks 6, 9. |
+| 8 | Spec §9 and Plan Task 5: settings in `netbox_client.py`/`models.py`, `.env.example`, README, `REGISTRY_EXCLUDED`. |
+| 9 | Spec §1: compliance exception documented, `OIDC_ACCEPT_NETBOX_TOKENS` (default `true`). |
+| 10 | Spec §4: distinguishing rule (`typ`, `scope`, `nonce`/`at_hash`). Plan Task 2: confirm with real tokens. |
 | 11 | Plan Task 6: `OidcJwtVerifier`. |
-| 12 | Spec §4/§9: `MCP_TRANSPORT=http` und `NETBOX_TOKEN_PASSTHROUGH=true` sind Pflicht, `TOKEN_STORE_PATH` ist Pflicht, Volume für UID 10001. |
-| 13 | Spec §4: Begründung für die Wahl von PyJWT. |
-| 14 | Spec §3 (Client-Tabelle), Plan Task 1: Secret nicht per Kommandozeile setzen. |
-| 15 | Plan Task 5: `tests/oidc/__init__.py`, Testdatei umbenannt in `test_oidc_config.py`. |
-| 16 | Spec §3: Fallbacks festgelegt, Upstream-Stand des IdP dokumentiert (RFC 8707 und PKCE-Pflicht dort nicht veröffentlicht). Token Exchange und `aud` per Scope-Mapping ausdrücklich ausgeschlossen. Plan Task 4. |
-| 17 | Spec §6: einfacheren Lebenszyklus als Alternative beschrieben, Entscheidung am Gate in Task 4. |
+| 12 | Spec §4/§9: `MCP_TRANSPORT=http` and `NETBOX_TOKEN_PASSTHROUGH=true` are mandatory, `TOKEN_STORE_PATH` is mandatory, volume for UID 10001. |
+| 13 | Spec §4: rationale for choosing PyJWT. |
+| 14 | Spec §3 (client table), Plan Task 1: do not set the secret via the command line. |
+| 15 | Plan Task 5: `tests/oidc/__init__.py`, test file renamed to `test_oidc_config.py`. |
+| 16 | Spec §3: fallbacks defined, upstream status of the IdP documented (RFC 8707 and mandatory PKCE not released there). Token exchange and `aud` via scope mapping explicitly excluded. Plan Task 4. |
+| 17 | Spec §6: simpler lifecycle described as an alternative, decision at the gate in Task 4. |
 
-## Nachtrag: Entscheidung zum Provider-Gate (2026-11-17)
+## Addendum: decision on the provider gate (2026-11-17)
 
-Entscheidung: auf native Unterstützung in einem **veröffentlichten** IdP-Release warten.
-Das ersetzt die Maßnahmen zu Befund 2 (Expression Policy) und 16 (Fallback-Reihenfolge).
+Decision: wait for native support in a **released** IdP version.
+This replaces the actions for finding 2 (expression policy) and 16 (fallback order).
 
-- Spec, neuer Abschnitt „Provider prerequisite“: Jede Umsetzung setzt ein IdP-Release voraus,
-  das RFC 8707 und verpflichtendes PKCE nur mit S256
-  nativ enthält. Merge, `main`, RC, Beta, Nightly und Milestone zählen nicht.
-  Für jedes Feature ist nachzuweisen, dass es im Release enthalten ist: Release Notes, Doku,
-  Merge-Commit im Release-Tag. Das Release wird zur Mindestversion.
-- Ausgeschlossen: Token Exchange, `aud` per Scope-Mapping, Expression Policy, Proxy,
-  gepatchter Build sowie ein Wechsel des IdP ohne neue Entscheidung.
-- Plan: neuer Task 0 (Release-Prüfung mit Ergebnistabelle) blockiert alle Phasen.
-  In Tasks 1, 12 und 13 wird die Provider-Version geprüft. Task 4 stoppt, wenn das Verhalten
-  nicht passt.
+- Spec, new section "Provider prerequisite": every implementation requires an IdP release that natively
+  contains RFC 8707 and mandatory PKCE with S256 only. Merge, `main`, RC, beta, nightly and milestone do
+  not count. For each feature it must be demonstrated that it is contained in the release: release notes,
+  docs, merge commit in the release tag. That release becomes the minimum version.
+- Excluded: token exchange, `aud` via scope mapping, expression policy, proxy, patched build, and a
+  change of IdP without a new decision.
+- Plan: new Task 0 (release check with a results table) blocks all phases.
+  Tasks 1, 12 and 13 check the provider version. Task 4 stops if the behavior does not match.
