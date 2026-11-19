@@ -22,14 +22,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.15.2-alpine3.24@sha256:2b4b04f31a4a009c1fadf7ce9338471f288488199cf43dcd1af71f244ea550aa
 LABEL org.opencontainers.image.title="NetBox MCP Server" \
-      org.opencontainers.image.description="MCP server for NetBox DCIM/IPAM management" \
-      org.opencontainers.image.url="https://github.com/mhajder/netbox-mcp" \
-      org.opencontainers.image.documentation="https://github.com/mhajder/netbox-mcp#readme" \
-      org.opencontainers.image.authors="Mateusz Hajder" \
-      org.opencontainers.image.source="https://github.com/mhajder/netbox-mcp" \
-      org.opencontainers.image.vendor="Mateusz Hajder" \
-      org.opencontainers.image.licenses="MIT" \
-      io.modelcontextprotocol.server.name="io.github.mhajder/netbox-mcp"
+      org.opencontainers.image.description="MCP server for NetBox DCIM/IPAM management (fork of mhajder/netbox-mcp with an OAuth authorization server)" \
+      org.opencontainers.image.url="https://github.com/wus-technik/netbox-mcp" \
+      org.opencontainers.image.documentation="https://github.com/wus-technik/netbox-mcp#readme" \
+      org.opencontainers.image.authors="Mateusz Hajder (original author), W&S Technik GmbH (fork)" \
+      org.opencontainers.image.source="https://github.com/wus-technik/netbox-mcp" \
+      org.opencontainers.image.vendor="W&S Technik GmbH" \
+      org.opencontainers.image.licenses="MIT"
 ENV PYTHONUNBUFFERED=1
 
 # The server runs as UID/GID 10001. In OAuth mode it keeps an encrypted state
