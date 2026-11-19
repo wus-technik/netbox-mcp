@@ -146,9 +146,11 @@ python-platform = "all"
 
 [tool.typos.default.extend-identifiers]
 TrUe = "TrUe"
+c1ba81e = "c1ba81e"  # commit hash in a review doc
 
 [tool.typos.default.extend-words]
 certifi = "certifi"
+Technik = "Technik"
 
 [tool.coverage.report]
 # Entry-point guards only call main(), which the tests run directly.

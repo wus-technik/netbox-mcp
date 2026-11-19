@@ -893,7 +893,7 @@ async def test_malformed_code_request_burns_code(http, store, fake_idp, drop) ->
 
 
 @pytest.mark.parametrize("bad", ["json_number", "json_list", "duplicate_field"])
-async def test_unparseable_code_request_burns_code(http, store, fake_idp, bad) -> None:
+async def test_unparsable_code_request_burns_code(http, store, fake_idp, bad) -> None:
     client_id, code = await get_code(http, fake_idp)
     body = {
         "grant_type": "authorization_code",
@@ -926,7 +926,7 @@ async def test_unparseable_code_request_burns_code(http, store, fake_idp, bad) -
         "grant_type=refresh_token&code={c}&refresh_token=a&refresh_token=b",
     ],
 )
-async def test_unparseable_request_without_unambiguous_code_grant_keeps_code(
+async def test_unparsable_request_without_unambiguous_code_grant_keeps_code(
     http, store, fake_idp, body
 ) -> None:
     client_id, code = await get_code(http, fake_idp)

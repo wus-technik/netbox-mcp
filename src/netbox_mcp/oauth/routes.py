@@ -774,7 +774,7 @@ class OAuthEndpoints:
             partial = exc.unambiguous
             code = partial.get("code")
             if partial.get("grant_type") == "authorization_code" and code:
-                # Burned on the first attempt, also an unparseable one.
+                # Burned on the first attempt, also an unparsable one.
                 try:
                     await self.manager.burn_code(code)
                 except StoreWriteError:
